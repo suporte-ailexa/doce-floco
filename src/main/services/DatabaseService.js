@@ -24,36 +24,21 @@ class DatabaseService {
      * Retorna itens para o menu da IA e Frontend
      * @returns {Object} { menuText: string, menuStructured: Array }
      */
-     async getActiveProducts() {
+    async getActiveProducts() {
         try {
             const snapshot = await this.db.collection('products').where('active', '==', true).get();
-            const menuStructured = []; // Isso a IA usa para saber a quantidade real (JSON)
-            const menuLines = [];      // Isso é o texto que a IA "lê" sobre o produto
-
+            const menuStructured = []; 
+            const menuLines = [];      
             snapshot.forEach(doc => {
                 const p = doc.data();
                 const stock = parseInt(p.quantity || 0);
                 const price = typeof p.price === 'number' ? p.price.toFixed(2) : p.price;
                 const hasImage = !!p.imagePath;
-
-                // --- ALTERAÇÃO: Só marcamos se estiver ESGOTADO ---
                 let stockInfo = "";
-                if (stock <= 0) {
-                    stockInfo = "[ESGOTADO]";
-                }
-                // REMOVEMOS O [RESTAM X]. Se tiver estoque, não escrevemos nada.
-                
+                if (stock <= 0) stockInfo = "[ESGOTADO]";
                 menuLines.push(`- ${p.name} (R$ ${price}) ${stockInfo}`);
-
-                menuStructured.push({
-                    id: doc.id,
-                    n: p.name,
-                    p: price,
-                    s: stock, // O número continua aqui para a IA calcular se pode vender
-                    img: hasImage
-                });
+                menuStructured.push({ id: doc.id, n: p.name, p: price, s: stock, img: hasImage });
             });
-
             return { menuStructured, menuText: menuLines };
         } catch (error) {
             console.error('[DB] Erro ao buscar produtos:', error);
@@ -61,24 +46,22 @@ class DatabaseService {
         }
     }
 
-    /**
-     * Verifica duplicidade de pedido agendado (Janela de 2 minutos)
-     */
+    async getLastPendingOrder(clientId) {
+        try {
+            const snapshot = await this.db.collection('orders').where('clientId', '==', clientId).where('status', '==', 'Pendente').orderBy('createdAt', 'desc').limit(1).get();
+            if (snapshot.empty) return null;
+            const doc = snapshot.docs[0];
+            return { id: doc.id, ...doc.data() };
+        } catch (error) { return null; }
+    }
+
     async isDuplicateOrder(clientId, items, total, date) {
         const twoMinsAgo = admin.firestore.Timestamp.fromMillis(Date.now() - 120000);
-        const snapshot = await this.db.collection('orders')
-            .where('clientId', '==', clientId)
-            .where('status', '==', 'Agendado')
-            .where('createdAt', '>', twoMinsAgo)
-            .get();
-
+        const snapshot = await this.db.collection('orders').where('clientId', '==', clientId).where('status', '==', 'Agendado').where('createdAt', '>', twoMinsAgo).get();
         let isDuplicate = false;
         snapshot.forEach(doc => {
             const d = doc.data();
-            // Comparação estrita dos dados vitais
-            if (d.items === items && parseFloat(d.total) === parseFloat(total) && d.dueDate === date) {
-                isDuplicate = true;
-            }
+            if (d.items === items && parseFloat(d.total) === parseFloat(total) && d.dueDate === date) isDuplicate = true;
         });
         return isDuplicate;
     }
@@ -88,7 +71,6 @@ class DatabaseService {
      * ATUALIZADO: Suporte a Empréstimo de Materiais (Caixas, Carrinhos)
      */
     async createScheduledOrder({ clientId, clientName, items, total, date, method, address, loanedItems, returnDate }) {
-        // 1. Check Anti-Duplicidade
         const isDup = await this.isDuplicateOrder(clientId, items, total, date);
         if (isDup) {
             console.log(`[Anti-Dup] Pedido ignorado para ${clientName}`);
@@ -115,7 +97,6 @@ class DatabaseService {
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             notes: loanedItems ? `⚠️ EMPRÉSTIMO: Devolução em ${returnDate}` : "Encomenda"
         };
-
         await this.db.collection('orders').add(orderData);
         return { success: true, type: 'scheduled' };
     }
@@ -124,33 +105,53 @@ class DatabaseService {
      * Cria Pedido com TRANSAÇÃO (Atualizado com ShortID)
      */
     async createStandardOrder({ clientId, clientName, items, total, method, payment, address, cart, shortId }) {
-        // ... (Lógica de Duplicidade mantida igual) ...
-
         const orderRef = this.db.collection('orders').doc();
+        // --- CORREÇÃO: Garante que o ID exista para o log e gravação ---
+        const finalShortId = shortId || "0000";
 
         try {
             await this.db.runTransaction(async (t) => {
-                // ... (Lógica de Estoque/Cart mantida igual) ...
+                const pendingUpdates = []; 
 
-                // Cria o pedido com o SHORT ID
+                if (cart && Array.isArray(cart) && cart.length > 0) {
+                    for (const item of cart) {
+                        if (!item.id) continue;
+                        const productRef = this.db.collection('products').doc(item.id);
+                        const productDoc = await t.get(productRef); 
+
+                        if (!productDoc.exists) {
+                            console.warn(`Produto ID ${item.id} não encontrado para baixa.`);
+                            continue;
+                        }
+
+                        const pData = productDoc.data();
+                        const currentQty = parseInt(pData.quantity || 0);
+                        const soldQty = parseInt(item.qty || item.quantity || 1);
+
+                        if (currentQty < soldQty) {
+                            throw new Error(`Estoque insuficiente para: ${pData.name} (Restam: ${currentQty})`);
+                        }
+
+                        pendingUpdates.push({ ref: productRef, newQty: currentQty - soldQty });
+                    }
+                }
+
+                for (const update of pendingUpdates) {
+                    t.update(update.ref, { quantity: update.newQty });
+                }
+
                 t.set(orderRef, {
-                    shortId: shortId || "0000", // NOVO CAMPO
-                    clientId,
-                    clientName,
-                    items: items || "Venda via IA",
-                    total: total || 0,
-                    deliveryMethod: method || "A Combinar",
-                    address: address || "Retirada",
-                    paymentMethod: payment || "A Combinar",
-                    status: "Pendente",
+                    shortId: finalShortId, // Usa a constante segura
+                    clientId, clientName, items: items || "Venda", total: total || 0,
+                    deliveryMethod: method || "A Combinar", address: address || "Retirada",
+                    paymentMethod: payment || "A Combinar", status: "Pendente",
                     createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                    notes: "Pedido Automático",
-                    cart: cart || []
+                    notes: "Pedido Automático", cart: cart || []
                 });
             });
 
-            console.log(`[DB] Pedido #${shortId} criado.`);
-            return { success: true, orderId: orderRef.id, shortId };
+            console.log(`[DB] Pedido #${finalShortId} criado e estoque atualizado.`);
+            return { success: true, orderId: orderRef.id, shortId: finalShortId };
 
         } catch (e) {
             console.error("[DB] Falha na transação:", e.message);
@@ -180,10 +181,7 @@ class DatabaseService {
      * Busca ou cria cliente baseado no telefone (ATUALIZADO)
      */
     async getOrCreateClient(rawPhone, name, countryCode = '55', address = null) {
-        // Normalização básica para busca
         let inputClean = rawPhone.replace('@c.us', '').replace(/\D/g, '');
-        
-        // Lógica de Permutações (Para encontrar o cliente mesmo com/sem 9º dígito)
         const candidates = new Set([inputClean, `+${inputClean}`]);
         if (inputClean.startsWith('55') && inputClean.length >= 12) {
             const ddd = inputClean.substring(2, 4);
@@ -196,15 +194,10 @@ class DatabaseService {
                 candidates.add(`55${ddd}9${numberPart}`);
             }
         }
-
         const snapshot = await this.db.collection('clients').where('phone', 'in', Array.from(candidates)).limit(1).get();
-        
         if (!snapshot.empty) {
             const doc = snapshot.docs[0];
             const data = doc.data();
-            
-            // Se veio um nome válido na criação manual, atualiza
-            // Se veio um endereço na criação manual e o cliente não tinha, atualiza
             let updates = {};
             if (name && name !== "Cliente" && data.name.startsWith("Cliente ") && name !== data.name) {
                 updates.name = name;
@@ -219,11 +212,8 @@ class DatabaseService {
                 await doc.ref.update(updates);
                 return { id: doc.id, ...data, ...updates };
             }
-
             return { id: doc.id, ...data };
         }
-
-        // Cria novo
         const newClient = {
             name: name || `Cliente ${inputClean.slice(-4)}`,
             phone: `+${inputClean}`,
@@ -252,7 +242,6 @@ class DatabaseService {
             .get();
 
         if (snapshot.empty) return "Histórico: Nenhum pedido anterior.";
-        
         return snapshot.docs.map(doc => {
             const d = doc.data();
             const date = d.createdAt ? DateTime.fromJSDate(d.createdAt.toDate()).toLocaleString(DateTime.DATE_SHORT) : '?';
@@ -279,7 +268,6 @@ class DatabaseService {
         return history.reverse().join("\n");
     }
     
-    // Método auxiliar para buscar caminho da imagem
     async getProductImagePath(productId) {
         const doc = await this.db.collection('products').doc(productId).get();
         if(doc.exists && doc.data().imagePath) return { path: doc.data().imagePath, name: doc.data().name };
@@ -316,7 +304,6 @@ class DatabaseService {
                 .get();
 
             if (snapshot.empty) return { success: true, appointments: [] };
-
             const appointments = snapshot.docs.map(doc => {
                 const data = doc.data();
                 return {
@@ -330,9 +317,7 @@ class DatabaseService {
                     service: data.items
                 };
             });
-            // Ordenação JS caso falte índice composto no Firestore
             appointments.sort((a, b) => b.rawDate - a.rawDate);
-
             return { success: true, appointments };
         } catch (error) {
             console.error("[DB] Erro getClientAppointments:", error);
@@ -340,7 +325,6 @@ class DatabaseService {
         }
     }
 
-    // Genérico para deletar (Clientes, Pedidos, Produtos)
     async deleteDocument(collection, id) {
         try {
             await this.db.collection(collection).doc(id).delete();
@@ -350,7 +334,6 @@ class DatabaseService {
         }
     }
 
-    // Genérico para atualizar
     async updateDocument(collection, id, data) {
         try {
             await this.db.collection(collection).doc(id).update(data);

@@ -1,5 +1,5 @@
 CONTEXTO DO PROJETO (CÓDIGO FONTE)
-Data da geração: 13/01/2026, 22:35:47
+Data da geração: 14/01/2026, 02:20:20
 
 ================================================================================
 ARQUIVO: /package.json
@@ -540,6 +540,10 @@ class AppController {
         });
 
         // --- ENCOMENDAS & PEDIDOS ---
+        
+        // ** NOVA FUNÇÃO DE CRIAÇÃO DE ENCOMENDA MANUAL **
+        ipcMain.handle('create-scheduled-order', async (e, data) => await this.db.createScheduledOrder(data));
+        
         ipcMain.handle('get-scheduled-orders', async () => await this.db.getScheduledOrders());
         ipcMain.handle('get-client-appointments', async (e, clientId) => await this.db.getClientAppointments(clientId));
         ipcMain.handle('delete-order', async (e, id) => await this.db.deleteDocument('orders', id));
@@ -548,6 +552,8 @@ class AppController {
         ipcMain.handle('update-order-status', async (e, { orderId, newStatus, shouldNotify, orderData }) => {
             const res = await this.db.updateDocument('orders', orderId, { status: newStatus });
             if (!res.success) return res;
+            
+            // --- ATUALIZAÇÃO: NOTIFICAÇÃO + LOG NO CHAT ---
             if (shouldNotify && this.wa.status === 'conectado') {
                 try {
                     const clientDoc = await this.db.db.collection('clients').doc(orderData.clientId).get();
@@ -562,9 +568,28 @@ class AppController {
                             case 'Pronto/Envio': message = isDelivery ? `🛵 Saiu para entrega!` : `🎁 Pronto para retirada!`; break;
                             case 'Concluído': message = `💜 Pedido finalizado! Obrigado!`; break;
                         }
-                        if (message) await this.wa.sendText(phone, message);
+                        
+                        if (message) {
+                            // 1. Envia no WhatsApp
+                            const sent = await this.wa.sendText(phone, message);
+                            
+                            // 2. [CRÍTICO] Loga no Chat do Sistema se enviou
+                            if (sent) {
+                                const chatId = phone.includes('@') ? phone : `${phone.replace(/\D/g,'')}@c.us`;
+                                await this.db.logMessage(orderData.clientId, {
+                                    chatId: chatId,
+                                    fromMe: true,
+                                    body: message,
+                                    content: message,
+                                    isAutomated: true,
+                                    read: true
+                                });
+                            }
+                        }
                     }
-                } catch (e) {}
+                } catch (e) {
+                    console.error('[Controller] Erro ao notificar status:', e);
+                }
             }
             return { success: true };
         });
@@ -572,14 +597,13 @@ class AppController {
         // --- CLIENTES ---
         ipcMain.handle('create-client-if-not-exists', async (e, data) => {
             try { 
-                // Passa o endereço recebido para o service
                 return { 
                     success: true, 
                     client: await this.db.getOrCreateClient(
                         data.rawPhone, 
                         data.name, 
                         data.countryCode, 
-                        data.address // Parâmetro novo
+                        data.address 
                     ) 
                 }; 
             } 
@@ -610,8 +634,7 @@ class AppController {
         // Relatório PDF
         ipcMain.handle('print-report', async (e, data) => {
             const workerWindow = new BrowserWindow({ show: false });
-            // ... (Template HTML do relatório) ...
-            const html = `<html><body><h1>Relatório Gerado</h1></body></html>`; // Simplificado aqui para não estourar linhas, mas funcional
+            const html = `<html><body><h1>Relatório Gerado</h1></body></html>`; 
             await workerWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`);
             workerWindow.webContents.print({ silent: false }); 
             return { success: true };
@@ -671,6 +694,12 @@ class AppController {
         const addressDisplay = orderData.address && orderData.address !== 'undefined' ? orderData.address : 'Retirada/Balcão';
         const notesHtml = orderData.notes ? `<div style="margin-top:5px; font-weight:bold; border:1px solid #000; padding:2px; font-size:10px;">OBS: ${orderData.notes}</div>` : '';
 
+        // Se houver Itens Emprestados (Encomendas)
+        let loanHtml = '';
+        if (orderData.loanedItems) {
+            loanHtml = `<div class="divider"></div><div class="info-row"><span class="info-label">DEVOLUÇÃO:</span> <span class="info-val">${orderData.returnDate || 'A combinar'}</span></div><div class="items-box">EMPRÉSTIMO:<br>${orderData.loanedItems}</div>`;
+        }
+
         const html = `
             <!DOCTYPE html>
             <html>
@@ -708,6 +737,7 @@ class AppController {
                     
                     <div class="divider"></div>
                     <div class="items-box">${itemsHtml}</div>
+                    ${loanHtml}
                     ${notesHtml}
                     <div class="divider"></div>
                     
@@ -899,6 +929,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   printReport: (data) => ipcRenderer.invoke('print-report', data),
   uploadConfigImage: (data) => ipcRenderer.invoke('upload-config-image', data),
   sendDailyShowcase: (chatId) => ipcRenderer.invoke('send-daily-showcase', chatId),
+  createScheduledOrder: (data) => ipcRenderer.invoke('create-scheduled-order', data),
+  updateScheduledOrder: (data) => ipcRenderer.invoke('update-scheduled-order', data),
+  deleteScheduledOrder: (id) => ipcRenderer.invoke('delete-scheduled-order', id),
 });
 
 ================================================================================
@@ -920,9 +953,8 @@ class AIService {
     init(apiKey) {
         try {
             this.genAI = new GoogleGenerativeAI(apiKey);
-            // Usando modelo flash para respostas rápidas
             this.model = this.genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-            console.log('[AI] Serviço Gemini inicializado (V6.1 - Validação de Estoque).');
+            console.log('[AI] Serviço Gemini inicializado (V6.2 - Pagamento Obrigatório).');
         } catch (e) {
             console.error('[AI] Falha ao iniciar Gemini:', e.message);
         }
@@ -989,75 +1021,43 @@ class AIService {
             : "";
 
         const knownAddressInfo = lastAddress 
-            ? `Endereço Conhecido do Cliente: "${lastAddress}". (Confirme se é este mesmo).` 
-            : "Endereço do Cliente: Não informado. (Você DEVE perguntar se for entrega).";
+            ? `Endereço Conhecido: "${lastAddress}".` 
+            : "Endereço: Não informado.";
 
-        // --- VALIDAÇÃO DO CARDÁPIO DE AÇAÍ ---
-        // Se não houver tamanhos cadastrados, consideramos que o açaí está indisponível na loja.
         const hasAcaiMenu = acaiSizes && acaiSizes.trim().length > 0;
         
-        let acaiSection = "";
-
-        if (hasAcaiMenu) {
-            // CENÁRIO A: Loja vende Açaí (Configurada)
-            acaiSection = `
-            === 🟣 MODO 1: MONTAGEM DE AÇAÍ/COPOS ===
-            (Produto montado na hora. Siga o roteiro):
-            1. TAMANHOS: [${acaiSizes}] -> OBRIGATÓRIO perguntar o tamanho primeiro.
-            2. COMPLEMENTOS GRÁTIS: [${freeAddons || 'Nenhum'}] -> Liste opções e pergunte.
-            3. 💰 UPSELL (Pagos): [${paidAddons || 'Nenhum'}] -> SEMPRE ofereça: "Quer adicionar Nutella ou Morango extra?".
-            
-            *Se o cliente pedir para ver a tabela, use o comando ###SEND_ACAI_MENU###.*
-            `;
-        } else {
-            // CENÁRIO B: Loja NÃO configurou Açaí (Vazia)
-            acaiSection = `
-            === 🚫 AÇAÍ INDISPONÍVEL NO MOMENTO ===
-            ATENÇÃO: No sistema da loja, as opções de Açaí/Copos estão vazias ou desativadas.
-            REGRA: Se o cliente perguntar por Açaí, diga educadamente que *não estamos servindo montagem de açaí hoje/no momento*, e sugira imediatamente os Picolés ou Potes Prontos da lista abaixo.
-            Não invente preços nem tamanhos.
-            `;
-        }
+        let acaiSection = hasAcaiMenu ? `
+            === 🟣 AÇAÍ ===
+            1. TAMANHOS: [${acaiSizes}].
+            2. GRÁTIS: [${freeAddons || 'Nenhum'}].
+            3. 💰 EXTRAS (Pagos): [${paidAddons || 'Nenhum'}].
+        ` : `=== 🚫 AÇAÍ OFF === (Não estamos servindo açaí hoje).`;
 
         return `
-        PERSONA: Você é a atendente virtual da ${storeName} (Especialista em Açaí e Picolés).
-        HOJE: ${dayName}, ${todayDate}. CLIENTE: ${clientName}.
-        LOCAL DA LOJA (RETIRADA): ${address || 'Balcão'}.
+        PERSONA: Atendente da ${storeName}. Data: ${todayDate}. Cliente: ${clientName}.
+        LOCAL: ${address || 'Balcão'}.
         ${knownAddressInfo}
-        
-        OBJETIVO: Vender refrescância! Use emojis: 💜 (Açaí), 🍦 (Picolé), ❄️ (Gelo).
-
-        ${contextWarning}
-
-        === 🚨 LÓGICA DE ENTREGA VS RETIRADA ===
-        1. Sempre identifique se é **Entrega (Delivery)** ou **Retirada**.
-        2. SE FOR ENTREGA: 
-           - O ENDEREÇO É OBRIGATÓRIO.
-           - Se já temos o endereço conhecido acima, pergunte: "Posso mandar para ${lastAddress || 'seu endereço'}?".
-           - Se não temos, pergunte: "Qual o endereço de entrega com bairro?".
-           - Taxa: R$ ${parseFloat(deliveryFee || 0).toFixed(2)}.
-        3. SE FOR RETIRADA:
-           - Não peça endereço do cliente. O endereço é "Retirada na Loja".
-           - Taxa: Grátis.
 
         ${acaiSection}
 
-        === 🍦 MODO 2: PICOLÉS E PRODUTOS PRONTOS (VITRINE) ===
-        Estoque Real Disponível: ${menuJson}
-        *JSON: { id, n: "Nome", p: "Preço", s: "Estoque" }*
-        *IMPORTANTE: Só venda se 's' (estoque) > 0. Se 's' for 0, diga que acabou.*
+        === 🍦 ESTOQUE (VITRINE) ===
+        ${menuJson}
+        *Se estoque (s) = 0, diga que acabou.*
 
-        === COMANDOS JSON (PROTOCOLO) ===
+        === 🚨 REGRAS DE PAGAMENTO (IMPORTANTE) ===
+        1. Aceitamos APENAS: **Pix**, **Dinheiro** ou **Cartão**.
+        2. "A Combinar" NÃO EXISTE.
+        3. **OBRIGATÓRIO:** Antes de confirmar o pedido, você DEVE perguntar: "Qual a forma de pagamento? (Pix, Dinheiro ou Cartão)".
+        4. NÃO gere o JSON "create_order" se o cliente não tiver definido o pagamento.
+
+        === REGRAS DE ENTREGA ===
+        - Retirada: Grátis.
+        - Entrega: Taxa R$ ${parseFloat(deliveryFee || 0).toFixed(2)}. Endereço obrigatório.
+
+        === COMANDOS JSON ===
+        Só gere quando tiver: Itens, Endereço (se entrega) e PAGAMENTO DEFINIDO.
+        ###JSON### {"type": "create_order", "items": "...", "total": 0.00, "method": "Entrega", "payment": "Pix", "address": "..."} ###ENDJSON###
         
-        A) CRIAR NOVO PEDIDO:
-        ###JSON### {"type": "create_order", "items": "...", "total": 0.00, "method": "Entrega", "address": "Rua X"} ###ENDJSON###
-        
-        B) ALTERAR ENDEREÇO (PÓS-CONFIRMAÇÃO):
-        ###JSON### {"type": "update_last_order", "newAddress": "Rua Nova, 500", "note": "Endereço Atualizado"} ###ENDJSON###
-
-        C) AÇÕES DE MÍDIA:
-        - Tabela Açaí: ###JSON### {"type": "send_image", "id": "cardapio_acai"} ###ENDJSON### (Só se Açaí estiver disponível)
-
         Histórico: ${history}
         Chat Atual:
         ${chatRecent}
@@ -1067,22 +1067,36 @@ class AIService {
     _parseResponse(aiResponseText) {
         let cleanText = aiResponseText;
         let command = null;
-        
         let sendAcaiMenu = false;
         let sendVitrine = false;
 
-        // 1. Detectar e Remover JSON
         const jsonMatch = aiResponseText.match(/###JSON###([\s\S]*?)###ENDJSON###/);
         if (jsonMatch && jsonMatch[1]) {
             try {
                 command = JSON.parse(jsonMatch[1].trim());
                 cleanText = cleanText.replace(jsonMatch[0], "").trim();
+                
+                // Validação de Segurança do Pagamento
+                if (command.type === 'create_order') {
+                    const validPayments = ['Pix', 'Dinheiro', 'Cartão'];
+                    // Normaliza para Title Case (ex: pix -> Pix)
+                    let pay = command.payment || '';
+                    pay = pay.charAt(0).toUpperCase() + pay.slice(1).toLowerCase();
+                    
+                    if (!validPayments.includes(pay)) {
+                        // Se a IA alucinar um pagamento inválido, forçamos null para não criar o pedido ainda
+                        // e deixamos apenas o texto perguntando.
+                        command = null; 
+                    } else {
+                        command.payment = pay;
+                    }
+                }
+
             } catch (e) {
                 console.error("[AI] JSON Parse Error:", e);
             }
         }
 
-        // 2. Flags Especiais
         if (cleanText.includes('###SEND_ACAI_MENU###')) {
             sendAcaiMenu = true;
             cleanText = cleanText.split('###SEND_ACAI_MENU###').join('').trim();
@@ -1093,16 +1107,7 @@ class AIService {
             cleanText = cleanText.split('###SEND_DAILY_VITRINE###').join('').trim();
         }
         
-        cleanText = cleanText.replace(/\n\s*\n/g, '\n').replace(/  +/g, ' ').trim();
-
-        return {
-            text: cleanText,
-            command: command,
-            specialActions: {
-                sendAcaiMenu,
-                sendVitrine
-            }
-        };
+        return { text: cleanText, command, specialActions: { sendAcaiMenu, sendVitrine } };
     }
 }
 
@@ -1198,8 +1203,9 @@ class DatabaseService {
 
     /**
      * Cria uma Encomenda (Agendamento)
+     * ATUALIZADO: Suporte a Empréstimo de Materiais (Caixas, Carrinhos)
      */
-    async createScheduledOrder({ clientId, clientName, items, total, date, method }) {
+    async createScheduledOrder({ clientId, clientName, items, total, date, method, address, loanedItems, returnDate }) {
         // 1. Check Anti-Duplicidade
         const isDup = await this.isDuplicateOrder(clientId, items, total, date);
         if (isDup) {
@@ -1216,10 +1222,16 @@ class DatabaseService {
             deliveryMethod: method || "Retirada",
             paymentMethod: "Sinal Pendente",
             status: "Agendado",
-            dueDate: date,
+            dueDate: date, // Data do Evento
+            address: address || "",
+            
+            // Novos Campos para Encomendas de Festa
             isPreOrder: true,
+            loanedItems: loanedItems || "", // Ex: "1 Caixa Isopor 50L"
+            returnDate: returnDate || "",   // Data para devolução
+            
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
-            notes: `Encomenda para ${date}. Via IA.`
+            notes: loanedItems ? `⚠️ EMPRÉSTIMO: Devolução em ${returnDate}` : "Encomenda"
         };
 
         await this.db.collection('orders').add(orderData);
@@ -1808,69 +1820,73 @@ ARQUIVO: /src/renderer/assets/js/modules/CalendarModule.js
 import { $, show, hide } from '../utils/DOM.js';
 import { UI } from '../utils/UI.js';
 import { CalendarService } from '../services/CalendarService.js';
+import { ClientService } from '../services/ClientService.js';
 
 export class CalendarModule {
     constructor() {
         this.service = new CalendarService();
-        // Usamos Luxon global (carregado via script tag no HTML)
+        this.clientService = new ClientService();
         this.DateTime = luxon.DateTime; 
         this.currentDate = this.DateTime.now();
 
-        // Elementos do Calendário
+        // Elementos UI Principal
         this.grid = $('calendarGrid');
         this.monthLabel = $('currentMonthLabel');
         this.btnPrev = $('btnPrevMonth');
         this.btnNext = $('btnNextMonth');
         this.btnNew = $('btnNewEncomenda');
 
-        // Elementos do Modal de Edição (Reutilizado do HTML principal)
-        this.editModal = $('editOrderModal');
-        this.editForm = $('editOrderForm');
-        this.btnCancelEdit = $('cancelEditOrderButton');
-        
-        // Elementos Específicos do Modal
-        this.btnModalDelete = $('btnModalDelete');
-        this.btnModalPrint = $('btnModalPrint');
+        // Modal Encomenda (Novo)
+        this.modal = $('encomendaModal');
+        this.form = $('encomendaForm');
+        this.clientSelect = $('encClientSelect');
+        this.btnClose = $('closeEncomendaModal');
+        this.btnDelete = $('btnDeleteEncomenda');
 
         // Bindings
         this.changeMonth = this.changeMonth.bind(this);
-        this.handleEditSubmit = this.handleEditSubmit.bind(this);
-        this.closeModal = this.closeModal.bind(this);
+        this.handleSave = this.handleSave.bind(this);
+        this.openModal = this.openModal.bind(this);
     }
 
     init() {
-        console.log('[Calendar] Iniciando...');
-        
-        // Renderiza estado inicial
+        console.log('[Calendar] Iniciando Gestão de Encomendas...');
         this.renderCalendar();
+        this.loadClients();
 
-        // Listeners de Navegação
+        // Listeners Navegação
         if (this.btnPrev) this.btnPrev.onclick = () => this.changeMonth(-1);
         if (this.btnNext) this.btnNext.onclick = () => this.changeMonth(1);
         
-        // Botão Nova Encomenda (Apenas informativo, pois a IA faz o agendamento)
-        if (this.btnNew) this.btnNew.onclick = () => {
-            UI.alert('Nova Encomenda', 'Para agendar, use a IA no WhatsApp ou crie um pedido na aba "Pedidos" e mude o status para "Agendado".');
-        };
+        // Listener Novo Agendamento
+        if (this.btnNew) this.btnNew.onclick = () => this.openModal();
 
-        // Listeners do Modal
-        if (this.editForm) this.editForm.addEventListener('submit', this.handleEditSubmit);
-        if (this.btnCancelEdit) this.btnCancelEdit.onclick = this.closeModal;
+        // Listeners Modal
+        if (this.form) this.form.onsubmit = this.handleSave;
+        if (this.btnClose) this.btnClose.onclick = () => hide(this.modal);
+        if (this.btnDelete) this.btnDelete.onclick = async () => {
+             if(await UI.confirm('Excluir', 'Tem certeza?', 'Excluir', 'red')) {
+                 const id = $('encId').value;
+                 if(id) {
+                     await this.service.deleteOrder(id);
+                     hide(this.modal);
+                     this.renderCalendar();
+                 }
+             }
+        };
     }
 
-    destroy() {
-        // Limpa listeners para evitar memory leaks e dupla execução
-        if (this.editForm) this.editForm.removeEventListener('submit', this.handleEditSubmit);
-        
-        // Limpa referências de clique
-        if (this.btnPrev) this.btnPrev.onclick = null;
-        if (this.btnNext) this.btnNext.onclick = null;
-        if (this.btnNew) this.btnNew.onclick = null;
-        if (this.btnCancelEdit) this.btnCancelEdit.onclick = null;
-        if (this.btnModalDelete) this.btnModalDelete.onclick = null;
-        if (this.btnModalPrint) this.btnModalPrint.onclick = null;
-
-        console.log('[Calendar] Finalizado.');
+    loadClients() {
+        this.clientService.listenToClients((clients) => {
+            if(!this.clientSelect) return;
+            this.clientSelect.innerHTML = '<option value="">Selecione o Cliente...</option>';
+            clients.forEach(c => {
+                const opt = document.createElement('option');
+                opt.value = c.id;
+                opt.textContent = c.name;
+                this.clientSelect.appendChild(opt);
+            });
+        });
     }
 
     changeMonth(direction) {
@@ -1881,61 +1897,61 @@ export class CalendarModule {
     async renderCalendar() {
         if (!this.grid || !this.monthLabel) return;
 
-        // Feedback de Carregamento
-        this.grid.innerHTML = '<div class="col-span-7 text-center text-gray-400 py-10 flex flex-col items-center gap-2"><i class="fas fa-spinner fa-spin"></i><span>Buscando Encomendas...</span></div>';
+        this.grid.innerHTML = '<div class="col-span-7 text-center py-10"><i class="fas fa-spinner fa-spin"></i></div>';
         this.monthLabel.textContent = this.currentDate.setLocale('pt-BR').toFormat('MMMM yyyy').toUpperCase();
 
-        // Busca Dados
         const res = await this.service.getScheduledOrders();
         const scheduledOrders = (res.success && res.orders) ? res.orders : [];
 
-        // Limpa Grid
         this.grid.innerHTML = '';
 
-        // Cálculos do Mês
         const firstDay = this.currentDate.startOf('month');
         const daysInMonth = this.currentDate.daysInMonth;
-        // Ajuste: Luxon weekday 7 é Domingo. Se quisermos Domingo como 0 no grid (comum em calendários), ajustamos:
         const startDayOfWeek = firstDay.weekday === 7 ? 0 : firstDay.weekday;
 
-        // Renderiza células vazias (dias do mês anterior)
+        // Dias vazios
         for (let i = 0; i < startDayOfWeek; i++) {
             const empty = document.createElement('div');
-            empty.className = 'bg-gray-50 rounded-lg opacity-30 border border-gray-100';
+            empty.className = 'bg-gray-50 opacity-30 border border-gray-100 rounded-lg';
             this.grid.appendChild(empty);
         }
 
-        // Renderiza dias do mês
+        // Dias do Mês
         for (let i = 1; i <= daysInMonth; i++) {
             const currentDayDate = firstDay.set({ day: i });
             const dateStr = currentDayDate.toFormat('yyyy-MM-dd');
             const isToday = dateStr === this.DateTime.now().toFormat('yyyy-MM-dd');
 
-            // Filtra encomendas deste dia
+            // Filtra encomendas
             const daysOrders = scheduledOrders.filter(o => o.dueDate === dateStr);
 
             const cell = document.createElement('div');
-            cell.className = `border rounded-lg p-2 flex flex-col relative h-28 hover:border-purple-300 transition overflow-hidden ${isToday ? 'bg-purple-50 border-purple-300 shadow-sm' : 'bg-white border-gray-100'}`;
+            cell.className = `border rounded-lg p-2 flex flex-col relative h-32 transition overflow-hidden group hover:border-purple-400 ${isToday ? 'bg-purple-50 border-purple-300' : 'bg-white border-gray-100'}`;
             
-            // Número do dia
             cell.innerHTML = `<span class="text-xs font-bold ${isToday ? 'text-purple-600' : 'text-gray-400'} mb-1">${i}</span>`;
             
+            // Botão "+" no hover do dia
+            const addBtn = document.createElement('button');
+            addBtn.className = 'absolute top-1 right-1 text-purple-400 hover:text-purple-700 opacity-0 group-hover:opacity-100 transition text-xs';
+            addBtn.innerHTML = '<i class="fas fa-plus"></i>';
+            addBtn.onclick = (e) => { e.stopPropagation(); this.openModal(null, dateStr); };
+            cell.appendChild(addBtn);
+
             const listDiv = document.createElement('div');
             listDiv.className = 'flex-1 overflow-y-auto space-y-1 custom-scrollbar';
             
-            // Badges das Encomendas
             daysOrders.forEach(o => {
                 const badge = document.createElement('div');
-                badge.className = 'text-[9px] bg-purple-100 text-purple-700 px-1 py-0.5 rounded truncate cursor-pointer hover:bg-purple-200 border border-purple-200 transition';
-                badge.textContent = `${o.clientName.split(' ')[0]} - R$${parseFloat(o.total).toFixed(0)}`;
-                badge.title = `${o.clientName}\n${o.items}\nTotal: R$ ${o.total}`;
+                const hasLoan = !!o.loanedItems;
+                // Cor diferente se tiver empréstimo (Laranja) ou normal (Roxo)
+                const colorClass = hasLoan 
+                    ? 'bg-orange-100 text-orange-700 border-orange-200' 
+                    : 'bg-purple-100 text-purple-700 border-purple-200';
+
+                badge.className = `text-[9px] px-1 py-0.5 rounded truncate cursor-pointer border hover:opacity-80 transition ${colorClass}`;
+                badge.innerHTML = `${hasLoan ? '<i class="fas fa-box text-[8px] mr-1"></i>' : ''} ${o.clientName.split(' ')[0]}`;
                 
-                // Clique no badge abre edição
-                badge.onclick = (e) => { 
-                    e.stopPropagation(); 
-                    this.openEditModal(o); 
-                };
-                
+                badge.onclick = (e) => { e.stopPropagation(); this.openModal(o); };
                 listDiv.appendChild(badge);
             });
 
@@ -1944,96 +1960,85 @@ export class CalendarModule {
         }
     }
 
-    openEditModal(order) {
-        // 1. Preencher Campos
-        $('editOrderId').value = order.id;
-        $('editOrderItems').value = order.items;
-        $('editOrderTotal').value = parseFloat(order.total).toFixed(2);
-        $('editOrderPayment').value = order.paymentMethod || 'A Combinar';
-        $('editOrderDelivery').value = order.deliveryMethod;
-        $('editOrderAddress').value = order.address || '';
+    openModal(order = null, preSelectedDate = null) {
+        // Reset Form
+        this.form.reset();
+        $('encId').value = '';
+        show(this.btnDelete); // Default show, hide se for novo
         
-        // Data (Tenta dueDate, senão pega createdAt)
-        const dateInput = $('editOrderDate');
-        if (order.dueDate) {
-            dateInput.value = order.dueDate;
-        } else if (order.createdAt) {
-            const dt = this.DateTime.fromJSDate(order.createdAt.toDate ? order.createdAt.toDate() : new Date(order.createdAt));
-            dateInput.value = dt.toFormat('yyyy-MM-dd');
+        if (order) {
+            // EDIÇÃO
+            $('encId').value = order.id;
+            this.clientSelect.value = order.clientId;
+            $('encDate').value = order.dueDate;
+            $('encItems').value = order.items;
+            $('encTotal').value = parseFloat(order.total || 0).toFixed(2);
+            $('encAddress').value = order.address || '';
+            
+            // Carrega Pagamento (NOVO)
+            if(order.paymentMethod) $('encPayment').value = order.paymentMethod;
+            
+            // Novos campos empréstimo
+            $('encLoanedItems').value = order.loanedItems || '';
+            $('encReturnDate').value = order.returnDate || '';
+            
+            show(this.btnDelete);
+        } else {
+            // NOVO
+            hide(this.btnDelete);
+            if (preSelectedDate) $('encDate').value = preSelectedDate;
         }
 
-        // Badge Visual no Modal
-        const badge = $('modalStatusBadge');
-        if(badge) {
-            badge.innerText = order.status;
-            badge.className = order.status === 'Agendado' 
-                ? 'text-[10px] px-2 py-1 rounded bg-purple-100 text-purple-600 font-bold uppercase border border-purple-200'
-                : 'text-[10px] px-2 py-1 rounded bg-gray-100 text-gray-500 font-bold uppercase border border-gray-200';
-        }
-
-        // 2. Configurar Botões de Ação (Delete/Print)
-        // Removemos listeners antigos clonando o nó (hack rápido) ou apenas reatribuindo onclick
-        
-        // Excluir
-        if (this.btnModalDelete) {
-            this.btnModalDelete.onclick = async () => {
-                if (await UI.confirm('Excluir Encomenda', 'Tem certeza? Essa ação não pode ser desfeita.', 'Excluir', 'red')) {
-                    const res = await this.service.deleteOrder(order.id);
-                    if (res.success) {
-                        UI.toast('Encomenda excluída.');
-                        this.closeModal();
-                        this.renderCalendar(); // Recarrega calendário
-                    } else {
-                        UI.alert('Erro', res.error);
-                    }
-                }
-            };
-        }
-
-        // Imprimir
-        if (this.btnModalPrint) {
-            this.btnModalPrint.onclick = async () => {
-                if (await UI.confirm('Imprimir', 'Deseja imprimir o comprovante?', 'Imprimir', 'blue')) {
-                    const res = await this.service.printOrder({ ...order, id: order.id });
-                    if (!res.success) UI.alert('Erro', res.error);
-                }
-            };
-        }
-
-        // 3. Mostrar Modal
-        show(this.editModal);
+        show(this.modal);
     }
 
-    closeModal() {
-        hide(this.editModal);
-    }
-
-    async handleEditSubmit(e) {
+    async handleSave(e) {
         e.preventDefault();
         
-        const id = $('editOrderId').value;
+        const id = $('encId').value;
+        const clientId = this.clientSelect.value;
+        if(!clientId) { UI.toast('Selecione um cliente', 'error'); return; }
         
-        // Coletar dados do form
-        const data = { 
-            items: $('editOrderItems').value, 
-            total: parseFloat($('editOrderTotal').value) || 0, 
-            paymentMethod: $('editOrderPayment').value, 
-            deliveryMethod: $('editOrderDelivery').value, 
-            address: $('editOrderAddress').value,
-            dueDate: $('editOrderDate').value // Importante: Atualiza a data do agendamento
+        const clientName = this.clientSelect.options[this.clientSelect.selectedIndex].text;
+        
+        const data = {
+            clientId,
+            clientName,
+            date: $('encDate').value,
+            items: $('encItems').value,
+            total: parseFloat($('encTotal').value) || 0,
+            address: $('encAddress').value,
+            loanedItems: $('encLoanedItems').value,
+            returnDate: $('encReturnDate').value,
+            // Salva Pagamento
+            paymentMethod: $('encPayment').value,
+            method: $('encAddress').value ? 'Entrega' : 'Retirada'
         };
 
-        try { 
-            const res = await this.service.updateOrder(id, data); 
-            if(res.success) { 
-                UI.toast('Encomenda atualizada!'); 
-                this.closeModal(); 
-                this.renderCalendar(); // Recarrega para refletir mudança de data/valor
-            } else { 
-                UI.alert('Erro', res.error); 
-            } 
-        } catch(err) { 
-            UI.alert('Erro', err.message); 
+        try {
+            if (id) {
+                // Update
+                const res = await this.service.updateOrder(id, {
+                    dueDate: data.date,
+                    items: data.items,
+                    total: data.total,
+                    address: data.address,
+                    deliveryMethod: data.method,
+                    paymentMethod: data.paymentMethod, // Envia para o banco
+                    loanedItems: data.loanedItems,
+                    returnDate: data.returnDate,
+                    notes: data.loanedItems ? `⚠️ EMPRÉSTIMO: Devolução em ${data.returnDate}` : ''
+                });
+                if(res.success) UI.toast('Encomenda atualizada!');
+            } else {
+                // Create
+                const res = await window.electronAPI.createScheduledOrder(data);
+                if(res.success) UI.toast('Encomenda agendada!');
+            }
+            hide(this.modal);
+            this.renderCalendar();
+        } catch (err) {
+            UI.alert('Erro', err.message);
         }
     }
 }
@@ -2330,6 +2335,28 @@ export class ClientsModule {
         if (this.listContainer) this.listContainer.removeEventListener('click', this.handleListClick);
     }
 
+    // --- HELPER PARA FORMATAR ITENS (CORREÇÃO DO [object Object]) ---
+    _formatItems(items) {
+        if (!items) return '-';
+        
+        // Se for string, retorna ela mesma
+        if (typeof items === 'string') return items;
+
+        // Se for Array de objetos (do Carrinho/PDV)
+        if (Array.isArray(items)) {
+            return items.map(i => {
+                if (typeof i === 'object') {
+                    const qtd = i.qty || i.quantity || i.q || 1;
+                    const nome = i.name || i.item || i.n || 'Item';
+                    return `${qtd}x ${nome}`;
+                }
+                return String(i);
+            }).join(', '); // Separa por vírgula para ficar compacto no histórico
+        }
+
+        return String(items);
+    }
+
     loadClients() {
         this.unsub = this.service.listenToClients((clients) => {
             this.renderList(clients);
@@ -2345,7 +2372,6 @@ export class ClientsModule {
             const div = document.createElement('div');
             div.className = 'bg-white p-3 rounded-lg shadow-sm border border-gray-100 flex justify-between items-center mb-2 animate-fade-in hover:border-purple-200 transition';
             
-            // Exibe endereço se existir
             const addressDisplay = c.address || c.lastAddress || 'Sem endereço cadastrado';
 
             div.innerHTML = `
@@ -2386,7 +2412,13 @@ export class ClientsModule {
             const chatNav = $('navConversas');
             if(chatNav) {
                 chatNav.click();
-                setTimeout(() => UI.toast(`Abra a conversa de ${btn.dataset.name}.`), 300);
+                // Pequeno delay para garantir que a UI trocou
+                setTimeout(() => {
+                    // Tenta acessar o ChatModule via global window.app (definido no App.js)
+                    if (window.app && window.app.modules.conversas) {
+                        window.app.modules.conversas.openChat(id, btn.dataset.name, btn.dataset.phone);
+                    }
+                }, 100);
             }
         }
         
@@ -2403,7 +2435,7 @@ export class ClientsModule {
                 name: btn.dataset.name,
                 phone: btn.dataset.phone,
                 countryCode: btn.dataset.cc,
-                address: btn.dataset.address // Pega do dataset
+                address: btn.dataset.address
             });
         }
     }
@@ -2413,7 +2445,7 @@ export class ClientsModule {
         const name = $('clientNameInput').value.trim();
         const phone = $('clientPhoneInput').value.trim();
         const cc = $('addClientCountryCode').value;
-        const address = $('clientAddressInput').value.trim(); // NOVO CAMPO
+        const address = $('clientAddressInput').value.trim();
 
         if (!name || !phone) {
             UI.alert('Atenção', 'Preencha nome e telefone.');
@@ -2421,7 +2453,6 @@ export class ClientsModule {
         }
 
         try {
-            // Envia o endereço junto
             const res = await this.service.createClient({ rawPhone: phone, name, countryCode: cc, address });
             if (res.success) {
                 this.addForm.reset();
@@ -2439,8 +2470,6 @@ export class ClientsModule {
         $('editClientName').value = clientData.name;
         $('editClientPhone').value = clientData.phone;
         $('editClientCountryCode').value = clientData.countryCode;
-        
-        // Preenche endereço
         $('editClientAddress').value = clientData.address || '';
 
         this.historyContainer.innerHTML = '<p class="text-xs text-gray-400 text-center py-4"><i class="fas fa-spinner fa-spin mr-2"></i>Carregando histórico...</p>';
@@ -2460,7 +2489,11 @@ export class ClientsModule {
             this.historyContainer.innerHTML = '<div class="text-center py-4 text-gray-400 text-xs">Nenhum pedido encontrado.</div>';
             return;
         }
+        
         appointments.forEach(o => {
+            // AQUI APLICAMOS A FORMATAÇÃO
+            const itemsReadable = this._formatItems(o.service);
+
             const item = document.createElement('div');
             item.className = 'border-b border-gray-50 py-2 hover:bg-gray-50 px-2 rounded';
             item.innerHTML = `
@@ -2468,7 +2501,9 @@ export class ClientsModule {
                     <span class="text-[10px] font-bold text-gray-400">${o.date}</span>
                     <span class="text-[10px] font-bold text-purple-600">${o.status}</span>
                 </div>
-                <div class="text-xs text-gray-700 truncate">${o.service}</div>
+                <!-- Exibe os itens formatados -->
+                <div class="text-xs text-gray-700 truncate" title="${itemsReadable}">${itemsReadable}</div>
+                <div class="text-[10px] text-gray-400 text-right">${o.time}</div>
             `;
             this.historyContainer.appendChild(item);
         });
@@ -2480,10 +2515,9 @@ export class ClientsModule {
         const name = $('editClientName').value.trim();
         const phone = $('editClientPhone').value.trim();
         const countryCode = $('editClientCountryCode').value;
-        const address = $('editClientAddress').value.trim(); // NOVO CAMPO
+        const address = $('editClientAddress').value.trim();
 
         try {
-            // Atualiza endereço também
             const res = await this.service.updateClient(id, { name, phone, countryCode, address });
             if (res.success) {
                 UI.toast('Cliente atualizado!');
@@ -2721,19 +2755,13 @@ ARQUIVO: /src/renderer/assets/js/modules/KanbanModule.js
 import { $, show, hide } from '../utils/DOM.js';
 import { UI } from '../utils/UI.js';
 import { OrderService } from '../services/OrderService.js';
-import { ClientService } from '../services/ClientService.js';
-import { ProductService } from '../services/ProductService.js';
 
 export class KanbanModule {
     constructor() {
         this.service = new OrderService();
-        this.clientService = new ClientService();
-        this.productService = new ProductService();
-        
         this.unsub = null;
-        this.currentCart = []; // Estado do carrinho manual
 
-        // Seletores do Board
+        // Seletores do Board (Colunas e Contadores)
         this.cols = {
             'Pendente': $('col-pending'),
             'Preparo': $('col-prep'),
@@ -2746,31 +2774,15 @@ export class KanbanModule {
             'Pronto/Envio': $('count-sent'),
             'Concluído': $('count-done')
         };
-
-        // Seletores do Formulário de Novo Pedido
-        this.orderForm = $('addOrderForm');
-        this.clientSelect = $('orderClientSelect');
-        this.productSelect = $('manualOrderProductSelect');
-        this.qtyInput = $('manualOrderQty');
-        this.btnAddItem = $('btnAddToOrder');
-        this.cartDisplay = $('manualOrderCart');
-        this.totalInput = $('orderTotal');
-        this.itemsHiddenInput = $('orderItems');
     }
 
     init() {
-        console.log('[Kanban] Iniciando...');
+        console.log('[Kanban] Iniciando Gestão de Fluxo...');
         
         // 1. Carrega o Quadro
         this.loadOrders();
 
-        // 2. Carrega os Selects do formulário
-        this.loadClientsForSelect();
-        this.loadProductsForSelect();
-
-        // 3. Configura o Carrinho Manual
-        this.setupCartEvents();
-
+        // 2. Listener do Modal de Edição (que está no index.html global)
         if($('editOrderForm')) $('editOrderForm').onsubmit = (e) => this.handleEditSubmit(e);
     }
 
@@ -2779,195 +2791,49 @@ export class KanbanModule {
         console.log('[Kanban] Finalizado.');
     }
 
+    // --- FORMATAÇÃO VISUAL ---
+    _formatItems(items, separator = '<br>') {
+        if (!items) return '-';
+        if (typeof items === 'string') return separator === '<br>' ? items.replace(/\n/g, '<br>') : items;
+        if (Array.isArray(items)) {
+            return items.map(i => {
+                if (typeof i === 'object') {
+                    const qtd = i.qty || i.quantity || i.q || 1;
+                    const nome = i.name || i.item || i.n || 'Item sem nome';
+                    const obs = i.obs ? ` (${i.obs})` : '';
+                    return `${qtd}x ${nome}${obs}`;
+                }
+                return String(i);
+            }).join(separator);
+        }
+        return String(items);
+    }
+
+    // --- AÇÕES DO MODAL DE EDIÇÃO ---
     async handleEditSubmit(e) {
-    e.preventDefault();
-    const id = $('editOrderId').value;
-    const data = { 
-        items: $('editOrderItems').value, 
-        total: parseFloat($('editOrderTotal').value) || 0, 
-        paymentMethod: $('editOrderPayment').value, 
-        deliveryMethod: $('editOrderDelivery').value, 
-        address: $('editOrderAddress').value,
-        dueDate: $('editOrderDate').value 
-    };
+        e.preventDefault();
+        const id = $('editOrderId').value;
+        const data = { 
+            items: $('editOrderItems').value, 
+            total: parseFloat($('editOrderTotal').value) || 0, 
+            paymentMethod: $('editOrderPayment').value, 
+            deliveryMethod: $('editOrderDelivery').value, 
+            address: $('editOrderAddress').value,
+            dueDate: $('editOrderDate').value 
+        };
 
-    try {
-        const res = await this.service.updateOrder(id, data);
-        if(res.success) {
-            UI.toast('Pedido atualizado!');
-            hide($('editOrderModal'));
-        }
-    } catch(err) {
-        UI.alert('Erro', err.message);
-    }
-}
-
-    // --- LÓGICA DE DADOS DOS SELECTS ---
-
-    async loadClientsForSelect() {
-        if (!this.clientSelect) return;
-        this.clientSelect.innerHTML = '<option value="">Carregando clientes...</option>';
-        
-        // Usamos o listener do service mas convertemos para uma carga única para o select
-        this.clientService.listenToClients((clients) => {
-            this.clientSelect.innerHTML = '<option value="">Selecione um cliente...</option>';
-            clients.forEach(c => {
-                const opt = document.createElement('option');
-                opt.value = c.id;
-                opt.textContent = c.name;
-                this.clientSelect.appendChild(opt);
-            });
-        });
-    }
-
-    async loadProductsForSelect() {
-        if (!this.productSelect) return;
-        this.productSelect.innerHTML = '<option value="">Carregando...</option>';
-        
-        const res = await this.productService.getActiveProducts();
-        this.productSelect.innerHTML = '<option value="">Selecione um Produto</option>';
-        
-        if (res.success && res.products) {
-            res.products.forEach(p => {
-                if (p.active !== false) {
-                    const opt = document.createElement('option');
-                    opt.value = p.id;
-                    const stock = p.quantity || 0;
-                    opt.textContent = `${p.name} (Estoque: ${stock}) - R$ ${parseFloat(p.price).toFixed(2)}`;
-                    // Guardamos dados extras no dataset para facilitar o carrinho
-                    opt.dataset.price = p.price;
-                    opt.dataset.name = p.name;
-                    this.productSelect.appendChild(opt);
-                }
-            });
+        try {
+            const res = await this.service.updateOrder(id, data);
+            if(res.success) {
+                UI.toast('Pedido atualizado!');
+                hide($('editOrderModal'));
+            }
+        } catch(err) {
+            UI.alert('Erro', err.message);
         }
     }
 
-    // --- LÓGICA DO CARRINHO MANUAL ---
-
-    setupCartEvents() {
-        // Botão Adicionar Item
-        if (this.btnAddItem) {
-            this.btnAddItem.onclick = () => {
-                const productId = this.productSelect.value;
-                const qty = parseInt(this.qtyInput.value);
-                
-                if (!productId || qty <= 0) {
-                    UI.toast('Selecione um produto e quantidade', 'error');
-                    return;
-                }
-
-                const opt = this.productSelect.options[this.productSelect.selectedIndex];
-                const existing = this.currentCart.find(i => i.id === productId);
-
-                if (existing) {
-                    existing.quantity += qty;
-                } else {
-                    this.currentCart.push({
-                        id: productId,
-                        name: opt.dataset.name,
-                        price: parseFloat(opt.dataset.price),
-                        quantity: qty
-                    });
-                }
-
-                this.renderCart();
-                // Limpa campos para o próximo item
-                this.productSelect.value = "";
-                this.qtyInput.value = 1;
-            };
-        }
-
-        // Submit do Formulário Inteiro
-        if (this.orderForm) {
-            this.orderForm.onsubmit = async (e) => {
-                e.preventDefault();
-                const clientId = this.clientSelect.value;
-                const total = parseFloat(this.totalInput.value);
-                const itemsStr = this.itemsHiddenInput.value;
-
-                if (!clientId || this.currentCart.length === 0) {
-                    UI.alert('Erro', 'Selecione o cliente e adicione itens ao pedido.');
-                    return;
-                }
-
-                const clientName = this.clientSelect.options[this.clientSelect.selectedIndex].text;
-
-                try {
-                    const res = await window.electronAPI.createManualOrder({
-                        clientId,
-                        clientName,
-                        items: itemsStr,
-                        total: total || 0,
-                        status: 'Pendente',
-                        deliveryMethod: 'Balcão',
-                        paymentMethod: 'A Combinar',
-                        notes: 'Manual',
-                        cart: this.currentCart // Array estruturado para baixa no estoque
-                    });
-
-                    if (res.success) {
-                        UI.toast('Pedido criado com sucesso!');
-                        this.currentCart = [];
-                        this.renderCart();
-                        this.orderForm.reset();
-                    } else {
-                        UI.alert('Erro de Estoque', res.error);
-                    }
-                } catch (err) {
-                    UI.alert('Erro', err.message);
-                }
-            };
-        }
-    }
-
-    renderCart() {
-        if (!this.cartDisplay) return;
-
-        if (this.currentCart.length === 0) {
-            hide(this.cartDisplay);
-            this.itemsHiddenInput.value = "";
-            this.totalInput.value = "";
-            return;
-        }
-
-        show(this.cartDisplay);
-        this.cartDisplay.innerHTML = '';
-        
-        let total = 0;
-        let itemsNames = [];
-
-        this.currentCart.forEach((item, index) => {
-            const subtotal = item.price * item.quantity;
-            total += subtotal;
-            itemsNames.push(`${item.quantity}x ${item.name}`);
-
-            const div = document.createElement('div');
-            div.className = "flex justify-between items-center border-b border-gray-100 pb-1 text-[11px]";
-            div.innerHTML = `
-                <span class="truncate flex-1"><b>${item.quantity}x</b> ${item.name}</span>
-                <span class="text-gray-500 mr-2">R$ ${subtotal.toFixed(2)}</span>
-                <button class="text-red-400 hover:text-red-600 remove-item" data-index="${index}">
-                    <i class="fas fa-times"></i>
-                </button>
-            `;
-            this.cartDisplay.appendChild(div);
-        });
-
-        // Atualiza campos ocultos e totais
-        this.totalInput.value = total.toFixed(2);
-        this.itemsHiddenInput.value = itemsNames.join(', ');
-
-        // Evento de remover item
-        this.cartDisplay.querySelectorAll('.remove-item').forEach(btn => {
-            btn.onclick = () => {
-                this.currentCart.splice(btn.dataset.index, 1);
-                this.renderCart();
-            };
-        });
-    }
-
-    // --- LÓGICA DO QUADRO KANBAN (Igual ao anterior) ---
+    // --- LÓGICA DO QUADRO KANBAN ---
 
     loadOrders() {
         this.unsub = this.service.listenToPendingOrders((orders) => {
@@ -2976,121 +2842,145 @@ export class KanbanModule {
     }
 
     renderBoard(orders) {
+        // Limpa colunas
         Object.values(this.cols).forEach(col => col.innerHTML = '');
+        
+        // Zera contadores
         const countsCalc = { 'Pendente': 0, 'Preparo': 0, 'Pronto/Envio': 0, 'Concluído': 0 };
 
         orders.forEach(order => {
-            if(order.status === 'Agendado') return;
+            if(order.status === 'Agendado') return; // Ignora agendamentos futuros
+            
             let status = order.status;
+            // Normalização de status antigos ou variações
             if (status === 'Entregue' || status === 'Finalizado') status = 'Concluído';
             if (!this.cols[status]) status = 'Pendente';
 
             countsCalc[status]++;
+            
             const card = this.createCard(order, status);
             this.cols[status].appendChild(card);
         });
 
+        // Atualiza badges de contagem
         Object.keys(countsCalc).forEach(key => {
             if (this.counts[key]) this.counts[key].innerText = countsCalc[key];
         });
     }
 
     createCard(data, currentStatus) {
-    const div = document.createElement('div');
-    div.className = 'kanban-card group';
-    const { DateTime } = luxon;
-    const timeStr = data.createdAt ? DateTime.fromJSDate(data.createdAt.toDate()).toFormat('HH:mm') : '--:--';
-    
-    div.innerHTML = `
-        <div class="flex justify-between items-start mb-2">
-            <span class="font-bold text-gray-700 text-sm truncate w-24">${data.clientName}</span>
-            <span class="text-[10px] text-gray-400 font-mono">${timeStr}</span>
-        </div>
-        <div class="text-xs text-gray-600 mb-2 leading-tight max-h-16 overflow-hidden">${data.items}</div>
-        <div class="flex justify-between items-center border-t border-gray-50 pt-2 mt-1">
-            <span class="font-bold text-gray-800 text-xs">R$ ${parseFloat(data.total).toFixed(2)}</span>
-            <div class="text-xs text-purple-500">${data.deliveryMethod}</div>
-        </div>
-        ${data.notes ? `<div class="text-[10px] text-red-400 mt-1 italic truncate"><i class="fas fa-sticky-note mr-1"></i>${data.notes}</div>` : ''}
+        const div = document.createElement('div');
+        div.className = 'kanban-card group bg-white p-3 rounded-xl shadow-sm border border-gray-100 mb-3';
         
-        <div class="flex justify-between mt-3 opacity-0 group-hover:opacity-100 transition-opacity">
-             <div class="flex gap-1">
-                <button class="text-gray-400 hover:text-red-500 p-1 btn-delete" title="Excluir"><i class="fas fa-trash text-xs"></i></button>
-                <button class="text-gray-400 hover:text-gray-600 p-1 btn-print" title="Imprimir"><i class="fas fa-print text-xs"></i></button>
-                <!-- BOTÃO EDITAR REINSERIDO AQUI -->
-                <button class="text-gray-400 hover:text-blue-500 p-1 btn-edit" title="Editar Pedido"><i class="fas fa-pen-to-square text-xs"></i></button>
-             </div>
-             <div class="flex gap-1">${this.getKanbanButtons(currentStatus)}</div>
-        </div>`;
+        const { DateTime } = luxon;
+        const timeStr = data.createdAt ? DateTime.fromJSDate(data.createdAt.toDate()).toFormat('HH:mm') : '--:--';
+        const itemsFormatted = this._formatItems(data.items, '<br>');
 
-    // Listener para o botão Editar
-    div.querySelector('.btn-edit').onclick = () => this.openEditOrderModal(data);
+        // Destaque para o Pagamento no Card
+        const payMethod = data.paymentMethod || '?';
+        let payColor = 'text-gray-500';
+        if(payMethod === 'Pix') payColor = 'text-green-600 font-bold';
+        if(payMethod === 'Cartão') payColor = 'text-blue-600 font-bold';
 
-    // Listener para o botão Imprimir
-    div.querySelector('.btn-print').onclick = async () => {
-        if(await UI.confirm('Imprimir', 'Deseja imprimir o cupom?', 'Imprimir', 'blue')) {
-            await this.service.printOrder(data);
-        }
-    };
+        div.innerHTML = `
+            <div class="flex justify-between items-start mb-2">
+                <span class="font-bold text-gray-700 text-sm truncate w-24">${data.clientName}</span>
+                <span class="text-[10px] text-gray-400 font-mono">${timeStr}</span>
+            </div>
+            <div class="text-xs text-gray-600 mb-2 leading-tight max-h-24 overflow-y-auto custom-scrollbar">${itemsFormatted}</div>
+            
+            <div class="flex justify-between items-center border-t border-gray-50 pt-2 mt-1">
+                <span class="font-bold text-gray-800 text-xs">R$ ${parseFloat(data.total).toFixed(2)}</span>
+                <div class="text-xs ${payColor}">${payMethod}</div>
+            </div>
+            ${data.notes ? `<div class="text-[10px] text-red-400 mt-1 italic truncate"><i class="fas fa-sticky-note mr-1"></i>${data.notes}</div>` : ''}
+            
+            <div class="flex justify-between mt-3 opacity-0 group-hover:opacity-100 transition-opacity">
+                 <div class="flex gap-1">
+                    <button class="text-gray-400 hover:text-red-500 p-1 btn-delete" title="Excluir"><i class="fas fa-trash text-xs"></i></button>
+                    <button class="text-gray-400 hover:text-gray-600 p-1 btn-print" title="Imprimir"><i class="fas fa-print text-xs"></i></button>
+                    <button class="text-gray-400 hover:text-blue-500 p-1 btn-edit" title="Editar Pedido"><i class="fas fa-pen-to-square text-xs"></i></button>
+                 </div>
+                 <div class="flex gap-1">${this.getKanbanButtons(currentStatus)}</div>
+            </div>`;
 
-    // Listener para o botão Excluir
-    div.querySelector('.btn-delete').onclick = async () => {
-        if(await UI.confirm('Excluir', 'Tem certeza?', 'Sim, Excluir', 'red')) {
-            await this.service.deleteOrder(data.id);
-        }
-    };
+        // Listeners dos Botões do Card
+        div.querySelector('.btn-edit').onclick = () => this.openEditOrderModal(data);
+        
+        div.querySelector('.btn-print').onclick = async () => {
+            if(await UI.confirm('Imprimir', 'Deseja imprimir o cupom?', 'Imprimir', 'blue')) { 
+                await this.service.printOrder(data); 
+            }
+        };
+        
+        div.querySelector('.btn-delete').onclick = async () => {
+            if(await UI.confirm('Excluir', 'Tem certeza?', 'Sim, Excluir', 'red')) { 
+                await this.service.deleteOrder(data.id); 
+            }
+        };
+        
+        const btnNext = div.querySelector('.btn-next');
+        if(btnNext) btnNext.onclick = () => this.advanceStatus(data.id, currentStatus, data);
 
-    const btnNext = div.querySelector('.btn-next');
-    if(btnNext) btnNext.onclick = () => this.advanceStatus(data.id, currentStatus, data);
-
-    return div;
-}
-
-// ADICIONE ESTE NOVO MÉTODO abaixo do createCard:
-
-openEditOrderModal(order) {
-    // 1. Preenche os campos do Modal (usando os IDs do HTML)
-    $('editOrderId').value = order.id;
-    $('editOrderItems').value = order.items;
-    $('editOrderTotal').value = parseFloat(order.total).toFixed(2);
-    $('editOrderPayment').value = order.paymentMethod || 'A Combinar';
-    $('editOrderDelivery').value = order.deliveryMethod;
-    $('editOrderAddress').value = order.address || '';
-    
-    // Data (dueDate ou createdAt)
-    const dateInput = $('editOrderDate');
-    if (order.dueDate) {
-        dateInput.value = order.dueDate;
-    } else if (order.createdAt) {
-        const dt = luxon.DateTime.fromJSDate(order.createdAt.toDate ? order.createdAt.toDate() : new Date(order.createdAt));
-        dateInput.value = dt.toFormat('yyyy-MM-dd');
+        return div;
     }
 
-    // Badge de status no modal
-    const badge = $('modalStatusBadge');
-    if(badge) {
-        badge.innerText = order.status;
-        badge.className = 'text-[10px] px-2 py-1 rounded bg-gray-100 text-gray-500 font-bold uppercase border border-gray-200';
-    }
-
-    // 2. Configura os botões extras do rodapé do modal (Excluir e Imprimir do modal)
-    $('btnModalDelete').onclick = async () => {
-        if (await UI.confirm('Excluir Pedido', 'Tem certeza?', 'Excluir', 'red')) {
-            await this.service.deleteOrder(order.id);
-            hide($('editOrderModal'));
+    openEditOrderModal(order) {
+        // Preenche Modal
+        $('editOrderId').value = order.id;
+        $('editOrderItems').value = this._formatItems(order.items, '\n');
+        $('editOrderTotal').value = parseFloat(order.total).toFixed(2);
+        
+        // Pagamento
+        const currentPay = order.paymentMethod;
+        const validOptions = ['Pix', 'Dinheiro', 'Cartão'];
+        if(validOptions.includes(currentPay)) {
+            $('editOrderPayment').value = currentPay;
+        } else {
+            $('editOrderPayment').selectedIndex = -1; // Força escolha se estiver inválido
         }
-    };
 
-    $('btnModalPrint').onclick = async () => {
-        await this.service.printOrder(order);
-    };
+        $('editOrderDelivery').value = order.deliveryMethod;
+        $('editOrderAddress').value = order.address || '';
+        
+        const dateInput = $('editOrderDate');
+        if (order.dueDate) {
+            dateInput.value = order.dueDate;
+        } else if (order.createdAt) {
+            const dt = luxon.DateTime.fromJSDate(order.createdAt.toDate ? order.createdAt.toDate() : new Date(order.createdAt));
+            dateInput.value = dt.toFormat('yyyy-MM-dd');
+        }
 
-    // 3. Define o evento de fechar
-    $('cancelEditOrderButton').onclick = () => hide($('editOrderModal'));
+        const badge = $('modalStatusBadge');
+        if(badge) {
+            badge.innerText = order.status;
+            badge.className = 'text-[10px] px-2 py-1 rounded bg-gray-100 text-gray-500 font-bold uppercase border border-gray-200';
+        }
 
-    // 4. Mostra o Modal
-    show($('editOrderModal'));
-}
+        // Botões do Rodapé do Modal
+        const btnDel = $('btnModalDelete');
+        // Clonamos o nó para remover listeners antigos e evitar duplicação de execução
+        const newBtnDel = btnDel.cloneNode(true);
+        btnDel.parentNode.replaceChild(newBtnDel, btnDel);
+        
+        newBtnDel.onclick = async () => {
+            if (await UI.confirm('Excluir Pedido', 'Tem certeza?', 'Excluir', 'red')) {
+                await this.service.deleteOrder(order.id);
+                hide($('editOrderModal'));
+            }
+        };
+
+        const btnPrint = $('btnModalPrint');
+        const newBtnPrint = btnPrint.cloneNode(true);
+        btnPrint.parentNode.replaceChild(newBtnPrint, btnPrint);
+
+        newBtnPrint.onclick = async () => { await this.service.printOrder(order); };
+
+        // Botão Fechar/Cancelar
+        $('cancelEditOrderButton').onclick = () => hide($('editOrderModal'));
+        
+        show($('editOrderModal'));
+    }
 
     getKanbanButtons(status) {
         if(status === 'Pendente') return `<button class="text-green-500 hover:bg-green-50 rounded p-1 btn-next"><i class="fas fa-arrow-right"></i></button>`;
@@ -3394,7 +3284,7 @@ export class ReportsModule {
                 await this.renderAll();
             };
         });
-        const btnPrint = $('btnIdPrintReport'); // Vamos criar este ID
+        const btnPrint = $('btnIdPrintReport');
         if(btnPrint) btnPrint.onclick = () => this.printReport();
     }
 
@@ -3413,14 +3303,14 @@ export class ReportsModule {
         const { DateTime } = luxon;
         const startDate = DateTime.now().minus({ days: this.period }).startOf('day');
 
-        // 1. Busca todos os produtos para ter um "Dicionário de Nomes"
+        // 1. Busca todos os produtos para ter um "Dicionário de Nomes" (mapeia ID -> Nome)
         const productsSnap = await this.db.collection('products').get();
         const productLookup = {};
         productsSnap.forEach(doc => {
             productLookup[doc.id] = doc.data().name;
         });
 
-        // 2. Busca pedidos concluídos no período
+        // 2. Busca pedidos (Status != Cancelado seria ideal, mas pegamos todos que tem total > 0)
         const snap = await this.db.collection('orders')
             .where('createdAt', '>=', startDate.toJSDate())
             .get();
@@ -3432,40 +3322,82 @@ export class ReportsModule {
             totalRevenue: 0,
             orderCount: orders.length,
             payments: {},
-            products: {}, // Aqui vamos guardar os nomes traduzidos
+            products: {}, 
             dailySales: {},
             clients: {},
             avgTicket: 0
         };
 
         orders.forEach(o => {
+            // Pula pedidos cancelados se houver status explícito, ou considera todos
+            // Aqui assumimos que se tem total, conta.
+            
             const val = parseFloat(o.total || 0);
             stats.totalRevenue += val;
 
-            // Pagamentos
-            const method = o.paymentMethod || 'Outros';
+            // --- 1. Pagamentos ---
+            // Normaliza nomes (ex: pix -> Pix)
+            let method = o.paymentMethod || 'Outros';
+            method = method.charAt(0).toUpperCase() + method.slice(1).toLowerCase();
+            if(method === 'A combinar') method = 'Outros'; 
             stats.payments[method] = (stats.payments[method] || 0) + val;
 
-            // Vendas Diárias
+            // --- 2. Vendas Diárias ---
             if (o.createdAt) {
                 const day = DateTime.fromJSDate(o.createdAt.toDate()).toFormat('dd/MM');
                 stats.dailySales[day] = (stats.dailySales[day] || 0) + val;
             }
 
-            // Ranking Clientes
+            // --- 3. Ranking Clientes ---
             const cName = o.clientName || 'Anônimo';
             if (!stats.clients[cName]) stats.clients[cName] = { total: 0, count: 0 };
             stats.clients[cName].total += val;
             stats.clients[cName].count += 1;
 
-            // --- TRADUÇÃO DE PRODUTOS AQUI ---
-            if (o.cart && Array.isArray(o.cart)) {
+            // --- 4. PRODUTOS POPULARES (CORREÇÃO DE PARSE) ---
+            
+            // CASO A: Carrinho Estruturado (Vindo do PDV ou IA Nova)
+            if (o.cart && Array.isArray(o.cart) && o.cart.length > 0) {
                 o.cart.forEach(item => {
-                    // Tenta pegar o nome salvo no item, ou busca no dicionário pelo ID, ou usa o ID como fallback
-                    const pName = item.name || productLookup[item.id] || `Produto Descontinuado (${item.id})`;
+                    // Tenta pegar o nome salvo, ou busca no lookup, ou usa o ID
+                    const pName = item.name || productLookup[item.id] || item.id || 'Item Desconhecido';
                     const qty = parseInt(item.qty || item.quantity || 0);
+                    if(qty > 0) {
+                        stats.products[pName] = (stats.products[pName] || 0) + qty;
+                    }
+                });
+            } 
+            // CASO B: Texto Simples (Vindo da IA antiga, Manual ou Edição)
+            else if (typeof o.items === 'string') {
+                // Quebra por quebra de linha ou vírgula
+                const lines = o.items.split(/[\n,]/);
+                
+                lines.forEach(line => {
+                    let cleanLine = line.trim();
+                    if(!cleanLine) return;
+
+                    // Regex inteligente para capturar quantidade: "2x Picolé" ou "2 Picolé" ou "Picolé"
+                    // Grupo 1: Quantidade (Opcional)
+                    // Grupo 2: Nome
+                    const match = cleanLine.match(/^(\d+)\s*[xX]?\s*(.+)$/);
                     
-                    stats.products[pName] = (stats.products[pName] || 0) + qty;
+                    let qty = 1;
+                    let name = cleanLine;
+
+                    if (match) {
+                        qty = parseInt(match[1]);
+                        name = match[2].trim();
+                    } else {
+                        // Se não tem número, assume 1, mas tenta limpar caracteres soltos como "-"
+                        name = name.replace(/^-\s*/, ''); 
+                    }
+
+                    // Ignora textos muito longos (provavelmente observações) ou vazios
+                    if (name.length > 2 && name.length < 60 && !name.toLowerCase().includes('entrega')) {
+                        // Padroniza primeira letra maiúscula para agrupar melhor
+                        name = name.charAt(0).toUpperCase() + name.slice(1).toLowerCase();
+                        stats.products[name] = (stats.products[name] || 0) + qty;
+                    }
                 });
             }
         });
@@ -3477,11 +3409,9 @@ export class ReportsModule {
     async printReport() {
         UI.toast("Preparando documento...");
 
-        // 1. Captura os gráficos como imagens Base64
-        const chartRevenueImg = this.charts.revenue.toBase64Image();
-        const chartPaymentsImg = this.charts.payments.toBase64Image();
+        const chartRevenueImg = this.charts.revenue ? this.charts.revenue.toBase64Image() : '';
+        const chartPaymentsImg = this.charts.payments ? this.charts.payments.toBase64Image() : '';
 
-        // 2. Coleta os dados das métricas
         const reportData = {
             period: this.period,
             revenue: $('repTotalRevenue').innerText,
@@ -3496,7 +3426,6 @@ export class ReportsModule {
             date: luxon.DateTime.now().toFormat('dd/MM/yyyy HH:mm')
         };
 
-        // 3. Envia para o Backend processar a impressão
         const res = await window.electronAPI.printReport(reportData);
         if(res.success) {
             UI.toast("Relatório enviado para a impressora!");
@@ -3515,13 +3444,20 @@ export class ReportsModule {
         const ctx = $('chartRevenue');
         if (this.charts.revenue) this.charts.revenue.destroy();
 
+        // Ordena as datas para o gráfico não ficar bagunçado
+        const sortedDates = Object.keys(stats.dailySales).sort((a, b) => {
+            const [da, ma] = a.split('/');
+            const [db, mb] = b.split('/');
+            return new Date(2024, ma-1, da) - new Date(2024, mb-1, db);
+        });
+
         this.charts.revenue = new Chart(ctx, {
             type: 'line',
             data: {
-                labels: Object.keys(stats.dailySales),
+                labels: sortedDates,
                 datasets: [{
                     label: 'Faturamento Diário',
-                    data: Object.values(stats.dailySales),
+                    data: sortedDates.map(d => stats.dailySales[d]),
                     borderColor: '#ec4899',
                     backgroundColor: 'rgba(236, 72, 153, 0.1)',
                     fill: true,
@@ -3542,7 +3478,7 @@ export class ReportsModule {
                 labels: Object.keys(stats.payments),
                 datasets: [{
                     data: Object.values(stats.payments),
-                    backgroundColor: ['#10b981', '#3b82f6', '#f59e0b', '#ef4444', '#8b5cf6']
+                    backgroundColor: ['#10b981', '#3b82f6', '#f59e0b', '#ef4444', '#8b5cf6', '#6366f1']
                 }]
             },
             options: { 
@@ -3554,29 +3490,29 @@ export class ReportsModule {
     }
 
     renderTopProducts(stats) {
-    const list = $('repTopProductsList');
-    list.innerHTML = '';
+        const list = $('repTopProductsList');
+        list.innerHTML = '';
 
-    // Transformamos o objeto de produtos em um array, ordenamos pelos mais vendidos e pegamos os top 5
-    const sorted = Object.entries(stats.products)
-        .sort(([, a], [, b]) => b - a)
-        .slice(0, 5);
+        // Converte objeto em array e ordena por quantidade decrescente
+        const sorted = Object.entries(stats.products)
+            .sort(([, a], [, b]) => b - a)
+            .slice(0, 5);
 
-    if (sorted.length === 0) {
-        list.innerHTML = '<p class="text-xs text-gray-400 text-center py-4">Nenhuma venda com dados estruturados encontrada neste período.</p>';
-        return;
+        if (sorted.length === 0) {
+            list.innerHTML = '<p class="text-xs text-gray-400 text-center py-4">Sem dados suficientes para ranking.</p>';
+            return;
+        }
+
+        sorted.forEach(([name, qty]) => {
+            const div = document.createElement('div');
+            div.className = 'flex justify-between items-center p-2 border-b border-gray-50';
+            div.innerHTML = `
+                <span class="text-sm text-gray-700 truncate pr-2" title="${name}">${name}</span>
+                <span class="text-sm font-bold text-purple-500 whitespace-nowrap">${qty} un.</span>
+            `;
+            list.appendChild(div);
+        });
     }
-
-    sorted.forEach(([name, qty]) => {
-        const div = document.createElement('div');
-        div.className = 'flex justify-between items-center p-2 border-b border-gray-50';
-        div.innerHTML = `
-            <span class="text-sm text-gray-700">${name}</span>
-            <span class="text-sm font-bold text-purple-500">${qty} un.</span>
-        `;
-        list.appendChild(div);
-    });
-}
 
     renderTopClients(stats) {
         const list = $('repTopClientsList');
@@ -3586,12 +3522,17 @@ export class ReportsModule {
             .sort(([,a], [,b]) => b.total - a.total)
             .slice(0, 5);
 
+        if (sorted.length === 0) {
+            list.innerHTML = '<p class="text-xs text-gray-400 text-center py-4">Sem dados.</p>';
+            return;
+        }
+
         sorted.forEach(([name, data]) => {
             const div = document.createElement('div');
             div.className = 'flex justify-between items-center p-2 border-b border-gray-50';
             div.innerHTML = `
                 <div class="flex flex-col">
-                    <span class="text-sm font-bold text-gray-700">${name}</span>
+                    <span class="text-sm font-bold text-gray-700 truncate w-32" title="${name}">${name}</span>
                     <span class="text-[10px] text-gray-400">${data.count} pedidos</span>
                 </div>
                 <span class="text-sm font-bold text-emerald-600">R$ ${data.total.toFixed(2)}</span>
@@ -3618,11 +3559,11 @@ export class SettingsModule {
         this.btnNext = $('next-step-btn');
         this.btnPrev = $('prev-step-btn');
         
-        // ESTRUTURA DE DADOS (Açaí & Picolés)
+        // ESTRUTURA DE DADOS
         this.chips = {
-            acaiSizes: new Set(),     // Ex: 300ml=12, 500ml=18
-            freeAddons: new Set(),    // Ex: Leite em pó, Paçoca
-            paidAddons: new Set()     // Ex: Nutella=5, Morango=3
+            acaiSizes: new Set(),
+            freeAddons: new Set(),
+            paidAddons: new Set()
         };
 
         // Controle do Stepper
@@ -3636,7 +3577,7 @@ export class SettingsModule {
     }
 
     init() {
-        console.log('[Settings] Iniciando V6.1 (Doce Floco Manager)...');
+        console.log('[Settings] Iniciando V6.2 (Doce Floco Manager)...');
         
         this.loadConfig();
         this.loadProducts();
@@ -3656,14 +3597,21 @@ export class SettingsModule {
     }
 
     // =========================================================================
-    // 1. STEPPER NAVIGATION
+    // 1. STEPPER NAVIGATION (CORRIGIDO VISUAL)
     // =========================================================================
     setupStepper() {
         const updateUI = () => {
-            // Atualiza barra de progresso
-            const progress = ((this.currentStep - 1) / (this.totalSteps - 1)) * 100;
+            // CORREÇÃO: Mapa de larguras fixas para garantir que a linha chegue na bolinha
+            // Como a bolinha tem fundo branco e z-index maior, podemos "passar" um pouco.
+            const widthMap = {
+                1: '0%',
+                2: '35%', // Era 33% (aumentado para esconder a ponta atrás da bolinha)
+                3: '68%', // Era 66%
+                4: '100%'
+            };
+
             const progressBar = $('stepperProgress');
-            if(progressBar) progressBar.style.width = `${progress}%`;
+            if(progressBar) progressBar.style.width = widthMap[this.currentStep];
 
             // Atualiza visibilidade dos painéis e indicadores
             for (let i = 1; i <= this.totalSteps; i++) {
@@ -3671,14 +3619,17 @@ export class SettingsModule {
                 if(panel) i === this.currentStep ? show(panel) : hide(panel);
 
                 // Atualiza visual das bolinhas (steps)
+                // Usamos querySelector para achar o elemento específico pelo data-step
                 const indicatorDiv = document.querySelector(`.step-indicator[data-step="${i}"] div`);
                 const indicatorText = document.querySelector(`.step-indicator[data-step="${i}"] span`);
                 
                 if (indicatorDiv && indicatorText) {
                     if (i <= this.currentStep) {
-                        indicatorDiv.className = 'w-6 h-6 rounded-full bg-white border-2 border-purple-600 mx-auto transition-colors duration-300';
+                        // Ativo ou Passado (Roxo)
+                        indicatorDiv.className = 'w-6 h-6 rounded-full bg-purple-600 border-2 border-purple-600 mx-auto transition-colors duration-300 shadow-md ring-2 ring-purple-100';
                         indicatorText.className = 'text-[10px] font-bold text-purple-600 mt-2 block uppercase tracking-wide';
                     } else {
+                        // Futuro (Cinza)
                         indicatorDiv.className = 'w-6 h-6 rounded-full bg-white border-2 border-gray-200 mx-auto transition-colors duration-300';
                         indicatorText.className = 'text-[10px] font-bold text-gray-400 mt-2 block uppercase tracking-wide';
                     }
@@ -3750,7 +3701,6 @@ export class SettingsModule {
             };
         };
 
-        // Configura inputs específicos da Açaiteria
         setupInput('inpAcaiSize', 'chipsAcaiSizeContainer', 'acaiSizes');
         setupInput('inpFreeAddon', 'chipsFreeAddonContainer', 'freeAddons');
         setupInput('inpPaidAddon', 'chipsPaidAddonContainer', 'paidAddons');
@@ -3764,7 +3714,6 @@ export class SettingsModule {
             const span = document.createElement('span');
             const hasPrice = tag.includes('=');
             
-            // Visual Diferenciado: Ciano para itens com preço (Upsell), Roxo para o resto
             span.className = `text-xs px-2 py-1 rounded-full flex items-center gap-1 border transition shadow-sm ${
                 hasPrice ? 'bg-cyan-50 text-cyan-700 border-cyan-200 font-bold' : 'bg-purple-50 text-purple-700 border-purple-200 font-medium'
             }`;
@@ -3779,7 +3728,6 @@ export class SettingsModule {
 
             span.innerHTML = `${displayText} <i class="fas fa-times cursor-pointer hover:text-red-500 ml-1 opacity-60 hover:opacity-100"></i>`;
             
-            // Remover Chip
             span.querySelector('i').onclick = () => {
                 this.chips[setKey].delete(tag);
                 this.renderChips(container, setKey);
@@ -3805,9 +3753,7 @@ export class SettingsModule {
             // Step 2: Regras & Açaí
             $('cfgDeliveryFee').value = d.deliveryFee || '';
             
-            // Status das Imagens
             if (d.imgAcaiPath) show($('statusImgAcai'));
-            if (d.menuFilePath) show($('menuFileStatus'));
 
             // Preenchimento dos Chips
             const loadSet = (dbString, setKey, containerId) => {
@@ -3854,7 +3800,7 @@ export class SettingsModule {
     }
 
     // =========================================================================
-    // 4. PRODUTOS / ESTOQUE (Picolés & Potes)
+    // 4. PRODUTOS / ESTOQUE
     // =========================================================================
     async loadProducts() {
         const container = $('productsListConfig');
@@ -3972,22 +3918,6 @@ export class SettingsModule {
         this.btnSave.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Salvando...';
 
         try {
-            // A. Upload Menu File (PDF)
-            const inpMenu = $('cfgMenuFile');
-            if (inpMenu && inpMenu.files.length > 0) {
-                const file = inpMenu.files[0];
-                const reader = new FileReader();
-                await new Promise(resolve => {
-                    reader.onload = async () => {
-                        await this.service.uploadMenuFile({ name: file.name, buffer: reader.result });
-                        resolve();
-                    };
-                    reader.readAsArrayBuffer(file);
-                });
-                show($('menuFileStatus'));
-            }
-
-            // B. Upload Imagem Tabela Açaí (Banner)
             let newAcaiPath = null;
             const inpAcai = $('cfgImgAcai');
             if (inpAcai && inpAcai.files.length > 0) {
@@ -3995,7 +3925,6 @@ export class SettingsModule {
                 const reader = new FileReader();
                 await new Promise(r => {
                     reader.onload = async () => {
-                        // Categoria 'acai' define o nome do arquivo no backend
                         const res = await window.electronAPI.uploadConfigImage({ category: 'acai', buffer: reader.result });
                         if(res.success) newAcaiPath = res.path;
                         r();
@@ -4004,32 +3933,22 @@ export class SettingsModule {
                 });
             }
 
-            // C. Construção do Objeto de Dados
             const data = {
-                // Step 1
                 storeName: $('cfgStoreName').value,
                 pixKey: $('cfgPixKey').value,
                 address: $('cfgAddress').value,
                 welcomeMsg: $('cfgWelcomeMsg').value,
                 useEmojis: $('cfgUseEmojis').checked,
-
-                // Step 2
                 deliveryFee: parseFloat($('cfgDeliveryFee').value) || 0,
-                
-                // Mapeamento das novas variáveis de Açaí
                 acaiSizes: Array.from(this.chips.acaiSizes).join(', '),
                 freeAddons: Array.from(this.chips.freeAddons).join(', '),
                 paidAddons: Array.from(this.chips.paidAddons).join(', '),
-
-                // Step 4
                 geminiApiKey: $('cfgApiKey').value,
                 printerName: $('cfgPrinterSelect').value,
                 autoPrint: $('cfgAutoPrint').checked
             };
 
-            if (newAcaiPath) {
-                data.imgAcaiPath = newAcaiPath;
-            }
+            if (newAcaiPath) data.imgAcaiPath = newAcaiPath;
 
             await this.service.saveStoreConfig(data);
             UI.toast('Configurações salvas e IA atualizada!');
@@ -4379,7 +4298,7 @@ ARQUIVO: /src/renderer/index.html
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Doce Floco Manager V6.1</title>
+    <title>Doce Floco Manager V6.2</title>
     
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
@@ -4445,8 +4364,9 @@ ARQUIVO: /src/renderer/index.html
         .toggle-label { width: 40px; height: 20px; position: relative; display: block; background: #e5e7eb; border-radius: 20px; cursor: pointer; transition: 0.3s; }
         
         /* Scrollbars */
-        .custom-scrollbar::-webkit-scrollbar { width: 5px; height: 5px; }
-        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar { overflow-y: auto; }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: rgba(0,0,0,0.05); border-radius: 4px; }
         .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
         .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
         
@@ -4497,7 +4417,7 @@ ARQUIVO: /src/renderer/index.html
                 <p id="authMessage" class="text-red-500 text-center text-xs hidden font-bold mt-2"></p>
             </form>
         </div>
-        <p class="text-slate-600 text-xs mt-8">V6.1 - Doce Floco (Açaí & Picolés)</p>
+        <p class="text-slate-600 text-xs mt-8">V6.2 - Doce Floco (Açaí & Picolés)</p>
     </div>
 
     <!-- =================================================================================
@@ -4583,7 +4503,7 @@ ARQUIVO: /src/renderer/index.html
             <header class="bg-white px-8 py-4 shadow-sm flex justify-between items-center z-10 border-b border-purple-100">
                 <div>
                     <h2 id="currentSectionTitle" class="text-xl font-bold text-gray-800 tracking-tight">Visão Geral</h2>
-                    <p class="text-xs text-gray-400">Terça-feira, 13 de Janeiro</p>
+                    <p class="text-xs text-gray-400">Gerenciador de Pedidos</p>
                 </div>
                 <div class="flex items-center gap-4">
                     <div class="text-right hidden md:block">
@@ -4652,64 +4572,38 @@ ARQUIVO: /src/renderer/index.html
 
                 <!-- 2. PEDIDOS (KANBAN + MANUAL) -->
                 <section id="sectionPedidos" class="content-section hidden flex flex-col h-full gap-6">
-                    <!-- Form Novo Pedido -->
-                    <div class="bg-white rounded-2xl shadow-sm p-5 border border-purple-100 flex-shrink-0">
-                        <h3 class="text-xs font-bold text-gray-400 uppercase mb-3"><i class="fas fa-plus-circle mr-1"></i> Novo Pedido Manual</h3>
-                        <form id="addOrderForm" class="flex flex-col md:flex-row gap-3 items-start">
-                            <div class="w-full md:w-1/4">
-                                <select id="orderClientSelect" class="w-full border rounded-lg p-2 text-sm bg-gray-50 h-[42px] focus:ring-1 focus:ring-purple-500 outline-none"></select>
-                            </div>
-                            <div class="flex-1 w-full flex flex-col gap-2 relative">
-                                <div class="flex gap-2">
-                                    <select id="manualOrderProductSelect" class="flex-1 border rounded-lg p-2 text-sm bg-white h-[42px] outline-none focus:border-purple-500 transition shadow-sm">
-                                        <option value="">Carregando produtos...</option>
-                                    </select>
-                                    <input type="number" id="manualOrderQty" value="1" min="1" class="w-16 border rounded-lg p-2 text-center text-sm h-[42px]" placeholder="Qtd">
-                                    <button type="button" id="btnAddToOrder" class="bg-purple-100 text-purple-600 border border-purple-200 px-4 rounded-lg hover:bg-purple-200 transition h-[42px]" title="Adicionar">
-                                        <i class="fas fa-plus"></i>
-                                    </button>
-                                </div>
-                                <!-- Mini Carrinho do Form -->
-                                <div id="manualOrderCart" class="bg-gray-50 border border-gray-200 rounded-lg p-3 max-h-32 overflow-y-auto text-xs space-y-1 hidden absolute top-[45px] w-full z-10 shadow-lg"></div>
-                                <input type="hidden" id="orderItems"> 
-                            </div>
-                            <div class="w-full md:w-32">
-                                <input type="number" step="0.50" id="orderTotal" placeholder="R$ 0.00" class="w-full border rounded-lg p-2 text-sm h-[42px] font-bold text-gray-700">
-                            </div>
-                            <button type="submit" class="bg-purple-600 text-white px-6 py-2 rounded-lg hover:bg-purple-700 text-sm font-bold h-[42px] whitespace-nowrap shadow-md transition transform active:scale-95">
-                                Criar
-                            </button>
-                        </form>
-                    </div>
-
-                    <!-- Kanban Board -->
-                    <div id="kanbanBoard" class="flex-1 grid grid-cols-4 gap-4 overflow-hidden min-h-[400px]">
-                        <div class="kanban-col bg-slate-50 border border-slate-200 rounded-xl flex flex-col p-3">
-                            <div class="kanban-col-title text-slate-500 font-bold text-xs uppercase mb-3 flex justify-between">
+                    <!-- Kanban Board - CORREÇÃO DE SCROLL AQUI -->
+                    <div id="kanbanBoard" class="flex-1 grid grid-cols-4 gap-4 overflow-hidden min-h-[400px] pt-2">
+                        <!-- Coluna Pendente -->
+                        <div class="kanban-col bg-slate-50 border border-slate-200 rounded-xl flex flex-col p-3 h-full min-h-0">
+                            <div class="kanban-col-title text-slate-500 font-bold text-xs uppercase mb-3 flex justify-between flex-shrink-0">
                                 <span><i class="fas fa-clock mr-1"></i> Pendente</span>
                                 <span id="count-pending" class="bg-slate-200 px-2 rounded-full text-[10px]">0</span>
                             </div>
                             <div id="col-pending" class="flex-1 overflow-y-auto space-y-3 custom-scrollbar pr-1"></div>
                         </div>
 
-                        <div class="kanban-col bg-orange-50 border border-orange-100 rounded-xl flex flex-col p-3">
-                            <div class="kanban-col-title text-orange-600 font-bold text-xs uppercase mb-3 flex justify-between">
+                        <!-- Coluna Preparo -->
+                        <div class="kanban-col bg-orange-50 border border-orange-100 rounded-xl flex flex-col p-3 h-full min-h-0">
+                            <div class="kanban-col-title text-orange-600 font-bold text-xs uppercase mb-3 flex justify-between flex-shrink-0">
                                 <span><i class="fas fa-blender mr-1"></i> Preparo</span>
                                 <span id="count-prep" class="bg-orange-200 px-2 rounded-full text-[10px]">0</span>
                             </div>
                             <div id="col-prep" class="flex-1 overflow-y-auto space-y-3 custom-scrollbar pr-1"></div>
                         </div>
 
-                        <div class="kanban-col bg-cyan-50 border border-cyan-100 rounded-xl flex flex-col p-3">
-                            <div class="kanban-col-title text-cyan-600 font-bold text-xs uppercase mb-3 flex justify-between">
+                        <!-- Coluna Envio/Pronto -->
+                        <div class="kanban-col bg-cyan-50 border border-cyan-100 rounded-xl flex flex-col p-3 h-full min-h-0">
+                            <div class="kanban-col-title text-cyan-600 font-bold text-xs uppercase mb-3 flex justify-between flex-shrink-0">
                                 <span><i class="fas fa-motorcycle mr-1"></i> Envio/Pronto</span>
                                 <span id="count-sent" class="bg-cyan-200 px-2 rounded-full text-[10px]">0</span>
                             </div>
                             <div id="col-sent" class="flex-1 overflow-y-auto space-y-3 custom-scrollbar pr-1"></div>
                         </div>
 
-                        <div class="kanban-col bg-emerald-50 border border-emerald-100 rounded-xl flex flex-col p-3">
-                            <div class="kanban-col-title text-emerald-600 font-bold text-xs uppercase mb-3 flex justify-between">
+                        <!-- Coluna Concluído -->
+                        <div class="kanban-col bg-emerald-50 border border-emerald-100 rounded-xl flex flex-col p-3 h-full min-h-0">
+                            <div class="kanban-col-title text-emerald-600 font-bold text-xs uppercase mb-3 flex justify-between flex-shrink-0">
                                 <span><i class="fas fa-check-circle mr-1"></i> Concluído</span>
                                 <span id="count-done" class="bg-emerald-200 px-2 rounded-full text-[10px]">0</span>
                             </div>
@@ -4718,7 +4612,7 @@ ARQUIVO: /src/renderer/index.html
                     </div>
                 </section>
 
-                <!-- 3. POS (FRENTE DE CAIXA) -->
+                <!-- 3. POS -->
                 <section id="sectionPos" class="content-section hidden h-full flex gap-6 overflow-hidden">
                     <!-- Esquerda: Catálogo -->
                     <div class="flex-1 flex flex-col bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
@@ -4740,14 +4634,12 @@ ARQUIVO: /src/renderer/index.html
                             <label class="text-[10px] font-bold text-slate-400 uppercase">Cliente</label>
                             <select id="posClientSelect" class="w-full bg-slate-900 border border-slate-600 rounded-lg p-2 text-sm mt-1 focus:border-purple-500 outline-none"></select>
                         </div>
-
                         <div id="posCartList" class="flex-1 overflow-y-auto p-4 space-y-2 custom-scrollbar">
                             <div id="posEmptyCart" class="h-full flex flex-col items-center justify-center text-slate-600 space-y-2 opacity-60">
                                 <i class="fas fa-shopping-basket text-4xl"></i>
                                 <p class="text-sm">Seu carrinho está vazio</p>
                             </div>
                         </div>
-
                         <div class="p-6 bg-slate-800 shadow-lg space-y-4">
                             <div class="flex justify-between items-center text-slate-400 text-sm">
                                 <span>Subtotal</span>
@@ -4780,7 +4672,7 @@ ARQUIVO: /src/renderer/index.html
                     </div>
                 </section>
 
-                <!-- 4. ENCOMENDAS (CALENDÁRIO) -->
+                <!-- 4. ENCOMENDAS -->
                 <section id="sectionEncomendas" class="content-section hidden h-full flex flex-col">
                     <div class="flex justify-between items-center mb-6">
                         <div>
@@ -4795,7 +4687,6 @@ ARQUIVO: /src/renderer/index.html
                             <i class="fas fa-plus mr-2"></i>Agendar
                         </button>
                     </div>
-                    
                     <div class="flex-1 bg-white rounded-2xl shadow-sm border border-gray-100 p-6 flex flex-col overflow-hidden">
                         <div class="grid grid-cols-7 gap-1 text-center mb-4">
                             <div class="text-xs font-bold text-gray-300 uppercase">Dom</div>
@@ -4814,7 +4705,6 @@ ARQUIVO: /src/renderer/index.html
                 <section id="sectionClientes" class="content-section hidden">
                     <div class="bg-white rounded-2xl shadow-sm p-6 mb-6 border border-gray-100">
                         <h3 class="text-xs font-bold text-gray-400 uppercase mb-4"><i class="fas fa-user-plus mr-1"></i> Cadastrar Cliente</h3>
-                        
                         <form id="addClientForm" class="space-y-4">
                             <div class="flex flex-col md:flex-row gap-4 items-start">
                                 <div class="w-full md:w-24">
@@ -4830,13 +4720,10 @@ ARQUIVO: /src/renderer/index.html
                                     <input type="text" id="clientPhoneInput" required class="w-full border rounded-lg p-2 text-sm h-[40px]" placeholder="DDD + Número">
                                 </div>
                             </div>
-                            
-                            <!-- NOVO CAMPO DE ENDEREÇO -->
                             <div>
                                 <label class="text-xs font-bold text-gray-500">Endereço Completo (Opcional)</label>
                                 <input type="text" id="clientAddressInput" class="w-full border rounded-lg p-2 text-sm h-[40px]" placeholder="Rua, Número, Bairro e Complemento">
                             </div>
-
                             <div class="flex justify-end">
                                 <button type="submit" class="bg-purple-600 text-white px-6 py-2 rounded-lg hover:bg-purple-700 font-bold h-[40px] shadow-md transition transform active:scale-95">
                                     Salvar Cliente
@@ -4844,12 +4731,11 @@ ARQUIVO: /src/renderer/index.html
                             </div>
                         </form>
                     </div>
-                    
                     <div class="space-y-2" id="clientsList"></div>
                     <p id="noClientsMessage" class="hidden text-center text-gray-400 mt-10">Nenhum cliente na base de dados.</p>
                 </section>
 
-                <!-- 6. WHATSAPP (CONEXÃO) -->
+                <!-- 6. WHATSAPP -->
                 <section id="sectionWhatsapp" class="content-section hidden flex flex-col items-center justify-center h-full">
                     <div class="bg-white p-12 rounded-3xl shadow-xl text-center max-w-md w-full border border-gray-100 relative overflow-hidden">
                         <div class="absolute top-0 left-0 w-full h-2 bg-gradient-to-r from-green-400 to-emerald-600"></div>
@@ -4860,7 +4746,6 @@ ARQUIVO: /src/renderer/index.html
                             <h3 class="text-2xl font-bold text-gray-800">Conexão WhatsApp</h3>
                             <p class="text-sm text-gray-500">Escaneie o QR Code para conectar o robô.</p>
                         </div>
-                        
                         <div class="mb-6">
                             <p class="text-xs font-bold text-gray-400 uppercase mb-2">Status da Conexão</p>
                             <p class="text-lg"><span id="whatsappStatusText" class="font-bold text-gray-400">Desconectado</span></p>
@@ -4881,7 +4766,7 @@ ARQUIVO: /src/renderer/index.html
                     </div>
                 </section>
 
-                <!-- 7. CONVERSAS (CHAT) -->
+                <!-- 7. CONVERSAS -->
                 <section id="sectionConversas" class="content-section hidden h-[calc(100vh-140px)] flex border border-gray-200 rounded-2xl overflow-hidden shadow-sm bg-white">
                     <!-- Lista Lateral -->
                     <div class="w-80 border-r bg-gray-50 flex flex-col">
@@ -4896,16 +4781,9 @@ ARQUIVO: /src/renderer/index.html
                         <!-- Header Chat -->
                         <div class="p-4 bg-white border-b flex justify-between items-center shadow-sm z-10">
                             <div class="flex items-center gap-3">
-                                <div class="w-10 h-10 rounded-full bg-purple-100 flex items-center justify-center text-purple-600 font-bold text-lg">
-                                    <i class="fas fa-user"></i>
-                                </div>
-                                <div>
-                                    <h4 id="currentChatClientName" class="font-bold text-gray-800 leading-tight">Cliente</h4>
-                                    <span class="text-xs text-green-500 font-medium flex items-center gap-1"><i class="fas fa-circle text-[8px]"></i> Online</span>
-                                </div>
+                                <div class="w-10 h-10 rounded-full bg-purple-100 flex items-center justify-center text-purple-600 font-bold text-lg"><i class="fas fa-user"></i></div>
+                                <div><h4 id="currentChatClientName" class="font-bold text-gray-800 leading-tight">Cliente</h4><span class="text-xs text-green-500 font-medium flex items-center gap-1"><i class="fas fa-circle text-[8px]"></i> Online</span></div>
                             </div>
-                            
-                            <!-- Toggle IA -->
                             <div class="flex items-center gap-3 bg-gray-100 px-4 py-2 rounded-full border border-gray-200">
                                 <span class="text-xs font-bold text-gray-500 uppercase">Robô Ativo</span>
                                 <div class="relative inline-block w-10 align-middle select-none">
@@ -4914,37 +4792,15 @@ ARQUIVO: /src/renderer/index.html
                                 </div>
                             </div>
                         </div>
-
-                        <!-- Área de Mensagens -->
                         <div id="messagesContainer" class="flex-1 p-6 overflow-y-auto flex flex-col space-y-3 custom-scrollbar bg-slate-50"></div>
-
-                        <!-- Input Area -->
                         <div class="p-4 bg-white border-t flex items-end gap-3">
-                            <!-- Botões de Ação Rápida -->
-                            <button id="btnDailyShowcase" class="bg-cyan-50 text-cyan-600 w-10 h-10 rounded-xl hover:bg-cyan-100 transition flex items-center justify-center border border-cyan-200 shadow-sm" title="Enviar Vitrine (Picolés)">
-                                <i class="fas fa-layer-group"></i>
-                            </button>
-                            <button id="btnQuickGallery" class="bg-purple-50 text-purple-600 w-10 h-10 rounded-xl hover:bg-purple-100 transition flex items-center justify-center border border-purple-200 shadow-sm" title="Enviar Foto Produto">
-                                <i class="fas fa-image"></i>
-                            </button>
-                            
-                            <!-- Input Texto -->
-                            <div class="flex-1 relative">
-                                <textarea id="chatMessageInput" rows="1" class="w-full border rounded-xl pl-4 pr-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 resize-none bg-gray-50" placeholder="Digite sua mensagem... (Enter para enviar)"></textarea>
-                            </div>
-                            
-                            <!-- Botão Enviar -->
-                            <button id="sendChatMessageButton" class="bg-purple-600 text-white w-12 h-10 rounded-xl hover:bg-purple-700 shadow-md transition flex items-center justify-center">
-                                <i class="fas fa-paper-plane"></i>
-                            </button>
+                            <button id="btnDailyShowcase" class="bg-cyan-50 text-cyan-600 w-10 h-10 rounded-xl hover:bg-cyan-100 transition flex items-center justify-center border border-cyan-200 shadow-sm" title="Enviar Vitrine (Picolés)"><i class="fas fa-layer-group"></i></button>
+                            <button id="btnQuickGallery" class="bg-purple-50 text-purple-600 w-10 h-10 rounded-xl hover:bg-purple-100 transition flex items-center justify-center border border-purple-200 shadow-sm" title="Enviar Foto Produto"><i class="fas fa-image"></i></button>
+                            <div class="flex-1 relative"><textarea id="chatMessageInput" rows="1" class="w-full border rounded-xl pl-4 pr-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 resize-none bg-gray-50" placeholder="Digite sua mensagem... (Enter para enviar)"></textarea></div>
+                            <button id="sendChatMessageButton" class="bg-purple-600 text-white w-12 h-10 rounded-xl hover:bg-purple-700 shadow-md transition flex items-center justify-center"><i class="fas fa-paper-plane"></i></button>
                         </div>
                     </div>
-
-                    <!-- Estado Vazio -->
-                    <div id="emptyChatState" class="flex-1 flex flex-col items-center justify-center text-gray-300 bg-white">
-                        <i class="far fa-comments text-6xl mb-4 text-purple-200"></i>
-                        <p class="font-medium text-gray-400">Selecione uma conversa para atender</p>
-                    </div>
+                    <div id="emptyChatState" class="flex-1 flex flex-col items-center justify-center text-gray-300 bg-white"><i class="far fa-comments text-6xl mb-4 text-purple-200"></i><p class="font-medium text-gray-400">Selecione uma conversa para atender</p></div>
                 </section>
 
                 <!-- 8. RELATÓRIOS -->
@@ -4952,9 +4808,7 @@ ARQUIVO: /src/renderer/index.html
                     <div class="flex justify-between items-center">
                         <h2 class="text-xl font-bold text-gray-800">Business Intelligence</h2>
                         <div class="flex items-center gap-4">
-                            <button id="btnIdPrintReport" class="bg-white border border-gray-200 text-gray-600 px-4 py-2 rounded-lg hover:bg-gray-50 transition text-xs font-bold flex items-center gap-2 shadow-sm">
-                                <i class="fas fa-file-pdf text-red-500"></i> Exportar Relatório
-                            </button>
+                            <button id="btnIdPrintReport" class="bg-white border border-gray-200 text-gray-600 px-4 py-2 rounded-lg hover:bg-gray-50 transition text-xs font-bold flex items-center gap-2 shadow-sm"><i class="fas fa-file-pdf text-red-500"></i> Exportar Relatório</button>
                             <div class="flex bg-white rounded-lg p-1 shadow-sm border border-gray-200">
                                 <button class="report-period-btn px-4 py-1 text-xs rounded-md bg-purple-600 text-white font-bold" data-days="7">7 Dias</button>
                                 <button class="report-period-btn px-4 py-1 text-xs rounded-md hover:bg-gray-100 text-gray-600" data-days="30">30 Dias</button>
@@ -4962,113 +4816,44 @@ ARQUIVO: /src/renderer/index.html
                             </div>
                         </div>
                     </div>
-
-                    <!-- Cards -->
                     <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-                        <div class="bg-white p-6 rounded-2xl shadow-sm border-t-4 border-purple-500">
-                            <p class="text-xs font-bold text-gray-400 uppercase">Faturamento Bruto</p>
-                            <h3 class="text-3xl font-black text-gray-800 mt-2" id="repTotalRevenue">R$ 0,00</h3>
-                        </div>
-                        <div class="bg-white p-6 rounded-2xl shadow-sm border-t-4 border-blue-500">
-                            <p class="text-xs font-bold text-gray-400 uppercase">Pedidos Realizados</p>
-                            <h3 class="text-3xl font-black text-gray-800 mt-2" id="repOrderCount">0</h3>
-                        </div>
-                        <div class="bg-white p-6 rounded-2xl shadow-sm border-t-4 border-emerald-500">
-                            <p class="text-xs font-bold text-gray-400 uppercase">Ticket Médio</p>
-                            <h3 class="text-3xl font-black text-gray-800 mt-2" id="repAvgTicket">R$ 0,00</h3>
-                        </div>
+                        <div class="bg-white p-6 rounded-2xl shadow-sm border-t-4 border-purple-500"><p class="text-xs font-bold text-gray-400 uppercase">Faturamento Bruto</p><h3 class="text-3xl font-black text-gray-800 mt-2" id="repTotalRevenue">R$ 0,00</h3></div>
+                        <div class="bg-white p-6 rounded-2xl shadow-sm border-t-4 border-blue-500"><p class="text-xs font-bold text-gray-400 uppercase">Pedidos Realizados</p><h3 class="text-3xl font-black text-gray-800 mt-2" id="repOrderCount">0</h3></div>
+                        <div class="bg-white p-6 rounded-2xl shadow-sm border-t-4 border-emerald-500"><p class="text-xs font-bold text-gray-400 uppercase">Ticket Médio</p><h3 class="text-3xl font-black text-gray-800 mt-2" id="repAvgTicket">R$ 0,00</h3></div>
                     </div>
-
-                    <!-- Gráficos -->
                     <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                        <div class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
-                            <h4 class="font-bold text-gray-700 mb-4">Evolução Diária</h4>
-                            <div class="h-64"><canvas id="chartRevenue"></canvas></div>
-                        </div>
-                        <div class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
-                            <h4 class="font-bold text-gray-700 mb-4">Meios de Pagamento</h4>
-                            <div class="h-64"><canvas id="chartPayments"></canvas></div>
-                        </div>
+                        <div class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100"><h4 class="font-bold text-gray-700 mb-4">Evolução Diária</h4><div class="h-64"><canvas id="chartRevenue"></canvas></div></div>
+                        <div class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100"><h4 class="font-bold text-gray-700 mb-4">Meios de Pagamento</h4><div class="h-64"><canvas id="chartPayments"></canvas></div></div>
                     </div>
-
-                    <!-- Listas -->
                     <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                        <div class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
-                            <h4 class="font-bold text-gray-700 mb-4 flex items-center gap-2"><i class="fas fa-crown text-yellow-400"></i> Top Clientes</h4>
-                            <div id="repTopClientsList" class="space-y-1"></div>
-                        </div>
-                        <div class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
-                            <h4 class="font-bold text-gray-700 mb-4 flex items-center gap-2"><i class="fas fa-star text-purple-400"></i> Produtos Populares</h4>
-                            <div id="repTopProductsList" class="space-y-1"></div>
-                        </div>
+                        <div class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100"><h4 class="font-bold text-gray-700 mb-4 flex items-center gap-2"><i class="fas fa-crown text-yellow-400"></i> Top Clientes</h4><div id="repTopClientsList" class="space-y-1"></div></div>
+                        <div class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100"><h4 class="font-bold text-gray-700 mb-4 flex items-center gap-2"><i class="fas fa-star text-purple-400"></i> Produtos Populares</h4><div id="repTopProductsList" class="space-y-1"></div></div>
                     </div>
                 </section>
 
-                <!-- 9. CONFIGURAÇÃO (TOTALMENTE NOVA) -->
+                <!-- 9. CONFIGURAÇÃO -->
                 <section id="sectionConfig" class="content-section hidden">
                     <div class="bg-white p-8 rounded-2xl shadow-lg max-w-5xl mx-auto border border-gray-100 min-h-[600px] flex flex-col relative overflow-hidden">
-                        
-                        <!-- Header Config -->
-                        <div class="text-center mb-8">
-                            <h2 class="text-2xl font-bold text-gray-800">Configuração da Loja</h2>
-                            <p class="text-sm text-gray-400">Ajuste os parâmetros da IA e do Cardápio</p>
-                        </div>
-
-                        <!-- Stepper Visual -->
+                        <div class="text-center mb-8"><h2 class="text-2xl font-bold text-gray-800">Configuração da Loja</h2><p class="text-sm text-gray-400">Ajuste os parâmetros da IA e do Cardápio</p></div>
                         <div class="mb-10 px-10 relative">
-                            <div class="relative w-full h-1 bg-gray-200 rounded overflow-hidden">
-                                <div id="stepperProgress" class="absolute top-0 left-0 h-full bg-purple-600 transition-all duration-500 ease-out" style="width: 0%"></div>
-                            </div>
+                            <div class="relative w-full h-1 bg-gray-200 rounded overflow-hidden"><div id="stepperProgress" class="absolute top-0 left-0 h-full bg-purple-600 transition-all duration-500 ease-out" style="width: 0%"></div></div>
                             <div class="flex justify-between -mt-3 relative z-10">
-                                <div class="step-indicator text-center cursor-default" data-step="1">
-                                    <div class="w-6 h-6 rounded-full bg-white border-2 border-purple-600 mx-auto transition-colors duration-300"></div>
-                                    <span class="text-[10px] font-bold text-purple-600 mt-2 block uppercase tracking-wide">Identidade</span>
-                                </div>
-                                <div class="step-indicator text-center cursor-default" data-step="2">
-                                    <div class="w-6 h-6 rounded-full bg-white border-2 border-gray-300 mx-auto transition-colors duration-300"></div>
-                                    <span class="text-[10px] font-bold text-gray-400 mt-2 block uppercase tracking-wide">Cardápio Açaí</span>
-                                </div>
-                                <div class="step-indicator text-center cursor-default" data-step="3">
-                                    <div class="w-6 h-6 rounded-full bg-white border-2 border-gray-300 mx-auto transition-colors duration-300"></div>
-                                    <span class="text-[10px] font-bold text-gray-400 mt-2 block uppercase tracking-wide">Estoque</span>
-                                </div>
-                                <div class="step-indicator text-center cursor-default" data-step="4">
-                                    <div class="w-6 h-6 rounded-full bg-white border-2 border-gray-300 mx-auto transition-colors duration-300"></div>
-                                    <span class="text-[10px] font-bold text-gray-400 mt-2 block uppercase tracking-wide">Sistema</span>
-                                </div>
+                                <div class="step-indicator text-center cursor-default" data-step="1"><div class="w-6 h-6 rounded-full bg-white border-2 border-purple-600 mx-auto transition-colors duration-300"></div><span class="text-[10px] font-bold text-purple-600 mt-2 block uppercase tracking-wide">Identidade</span></div>
+                                <div class="step-indicator text-center cursor-default" data-step="2"><div class="w-6 h-6 rounded-full bg-white border-2 border-gray-300 mx-auto transition-colors duration-300"></div><span class="text-[10px] font-bold text-gray-400 mt-2 block uppercase tracking-wide">Cardápio Açaí</span></div>
+                                <div class="step-indicator text-center cursor-default" data-step="3"><div class="w-6 h-6 rounded-full bg-white border-2 border-gray-300 mx-auto transition-colors duration-300"></div><span class="text-[10px] font-bold text-gray-400 mt-2 block uppercase tracking-wide">Estoque</span></div>
+                                <div class="step-indicator text-center cursor-default" data-step="4"><div class="w-6 h-6 rounded-full bg-white border-2 border-gray-300 mx-auto transition-colors duration-300"></div><span class="text-[10px] font-bold text-gray-400 mt-2 block uppercase tracking-wide">Sistema</span></div>
                             </div>
                         </div>
-
-                        <!-- Formulário -->
                         <form id="configForm" class="flex-1 flex flex-col">
-                            
-                            <!-- STEP 1: IDENTIDADE -->
                             <div id="step-1" class="step-panel space-y-6 animate-fade-in">
                                 <div class="grid grid-cols-2 gap-6">
-                                    <div>
-                                        <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Nome do Estabelecimento</label>
-                                        <input id="cfgStoreName" class="w-full border rounded-lg p-3 text-sm focus:ring-2 focus:ring-purple-500 outline-none" placeholder="Ex: Doce Floco">
-                                    </div>
-                                    <div>
-                                        <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Chave Pix</label>
-                                        <input id="cfgPixKey" class="w-full border rounded-lg p-3 text-sm bg-green-50 focus:ring-2 focus:ring-green-500 outline-none" placeholder="Email, CPF...">
-                                    </div>
+                                    <div><label class="block text-xs font-bold text-gray-500 uppercase mb-1">Nome do Estabelecimento</label><input id="cfgStoreName" class="w-full border rounded-lg p-3 text-sm focus:ring-2 focus:ring-purple-500 outline-none" placeholder="Ex: Doce Floco"></div>
+                                    <div><label class="block text-xs font-bold text-gray-500 uppercase mb-1">Chave Pix</label><input id="cfgPixKey" class="w-full border rounded-lg p-3 text-sm bg-green-50 focus:ring-2 focus:ring-green-500 outline-none" placeholder="Email, CPF..."></div>
                                 </div>
-                                <div>
-                                    <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Endereço (Retirada)</label>
-                                    <input id="cfgAddress" class="w-full border rounded-lg p-3 text-sm focus:ring-2 focus:ring-purple-500 outline-none">
-                                </div>
-                                <div>
-                                    <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Mensagem de Boas-vindas</label>
-                                    <textarea id="cfgWelcomeMsg" class="w-full border rounded-lg p-3 text-sm focus:ring-2 focus:ring-purple-500 outline-none" rows="2" placeholder="Ex: Olá! Sou a assistente virtual da Doce Floco."></textarea>
-                                </div>
-                                <div class="flex items-center gap-3 bg-gray-50 p-3 rounded-lg border border-gray-100">
-                                    <input type="checkbox" id="cfgUseEmojis" class="w-5 h-5 accent-purple-600 rounded cursor-pointer">
-                                    <label for="cfgUseEmojis" class="text-sm font-medium text-gray-700 cursor-pointer">Usar Emojis nas Respostas da IA (💜, 🍦, ❄️)</label>
-                                </div>
+                                <div><label class="block text-xs font-bold text-gray-500 uppercase mb-1">Endereço (Retirada)</label><input id="cfgAddress" class="w-full border rounded-lg p-3 text-sm focus:ring-2 focus:ring-purple-500 outline-none"></div>
+                                <div><label class="block text-xs font-bold text-gray-500 uppercase mb-1">Mensagem de Boas-vindas</label><textarea id="cfgWelcomeMsg" class="w-full border rounded-lg p-3 text-sm focus:ring-2 focus:ring-purple-500 outline-none" rows="2" placeholder="Ex: Olá! Sou a assistente virtual da Doce Floco."></textarea></div>
+                                <div class="flex items-center gap-3 bg-gray-50 p-3 rounded-lg border border-gray-100"><input type="checkbox" id="cfgUseEmojis" class="w-5 h-5 accent-purple-600 rounded cursor-pointer"><label for="cfgUseEmojis" class="text-sm font-medium text-gray-700 cursor-pointer">Usar Emojis nas Respostas da IA (💜, 🍦, ❄️)</label></div>
                             </div>
-
-                            <!-- STEP 2: CARDÁPIO AÇAÍ (Lógica SettingsModule) -->
                             <div id="step-2" class="step-panel hidden space-y-6 animate-fade-in">
                                 <div class="bg-purple-50 p-6 rounded-xl border border-purple-100 relative overflow-hidden">
                                     <i class="fas fa-utensils text-6xl text-purple-200 absolute -right-4 -bottom-4 opacity-50"></i>
@@ -5076,66 +4861,33 @@ ARQUIVO: /src/renderer/index.html
                                         <h3 class="text-sm font-bold text-purple-800 uppercase flex items-center gap-2"><i class="fas fa-wine-glass"></i> Montagem de Copos (Açaí)</h3>
                                         <div class="flex items-center gap-2 z-10">
                                             <span id="statusImgAcai" class="text-[10px] text-green-600 font-bold hidden bg-white px-2 py-1 rounded shadow-sm"><i class="fas fa-check-circle"></i> Imagem Salva</span>
-                                            <label class="cursor-pointer bg-white text-purple-600 px-3 py-1 rounded-lg text-xs font-bold border border-purple-200 shadow-sm hover:bg-purple-100 transition">
-                                                <i class="fas fa-upload mr-1"></i> Upload Tabela <input type="file" id="cfgImgAcai" accept="image/*" class="hidden">
-                                            </label>
+                                            <label class="cursor-pointer bg-white text-purple-600 px-3 py-1 rounded-lg text-xs font-bold border border-purple-200 shadow-sm hover:bg-purple-100 transition"><i class="fas fa-upload mr-1"></i> Upload Tabela <input type="file" id="cfgImgAcai" accept="image/*" class="hidden"></label>
                                         </div>
                                     </div>
-
                                     <div class="space-y-4 relative z-10">
-                                        <div>
-                                            <label class="text-[10px] font-bold text-purple-400 uppercase">Tamanhos (Ex: 300ml=12)</label>
-                                            <div id="chipsAcaiSizeContainer" class="flex flex-wrap gap-2 mb-2 min-h-[30px]"></div>
-                                            <input id="inpAcaiSize" class="w-full text-xs p-2 rounded border border-purple-200 focus:outline-none focus:ring-2 focus:ring-purple-400 bg-white/80" placeholder="Digite e aperte Enter...">
-                                        </div>
+                                        <div><label class="text-[10px] font-bold text-purple-400 uppercase">Tamanhos (Ex: 300ml=12)</label><div id="chipsAcaiSizeContainer" class="flex flex-wrap gap-2 mb-2 min-h-[30px]"></div><input id="inpAcaiSize" class="w-full text-xs p-2 rounded border border-purple-200 focus:outline-none focus:ring-2 focus:ring-purple-400 bg-white/80" placeholder="Digite e aperte Enter..."></div>
                                     </div>
                                 </div>
-
                                 <div class="grid grid-cols-2 gap-6">
-                                    <div class="bg-white p-4 rounded-xl border border-gray-200 shadow-sm">
-                                        <label class="text-xs font-bold text-gray-500 uppercase block mb-2">Complementos Grátis</label>
-                                        <div id="chipsFreeAddonContainer" class="flex flex-wrap gap-2 mb-2 min-h-[40px]"></div>
-                                        <input id="inpFreeAddon" class="w-full text-xs p-2 border-b border-gray-200 focus:border-purple-500 outline-none bg-transparent" placeholder="Ex: Leite em pó...">
-                                    </div>
-                                    <div class="bg-white p-4 rounded-xl border border-gray-200 shadow-sm">
-                                        <label class="text-xs font-bold text-gray-500 uppercase block mb-2">Adicionais Pagos (Upsell)</label>
-                                        <div id="chipsPaidAddonContainer" class="flex flex-wrap gap-2 mb-2 min-h-[40px]"></div>
-                                        <input id="inpPaidAddon" class="w-full text-xs p-2 border-b border-gray-200 focus:border-purple-500 outline-none bg-transparent" placeholder="Ex: Nutella=5...">
-                                    </div>
+                                    <div class="bg-white p-4 rounded-xl border border-gray-200 shadow-sm"><label class="text-xs font-bold text-gray-500 uppercase block mb-2">Complementos Grátis</label><div id="chipsFreeAddonContainer" class="flex flex-wrap gap-2 mb-2 min-h-[40px]"></div><input id="inpFreeAddon" class="w-full text-xs p-2 border-b border-gray-200 focus:border-purple-500 outline-none bg-transparent" placeholder="Ex: Leite em pó..."></div>
+                                    <div class="bg-white p-4 rounded-xl border border-gray-200 shadow-sm"><label class="text-xs font-bold text-gray-500 uppercase block mb-2">Adicionais Pagos (Upsell)</label><div id="chipsPaidAddonContainer" class="flex flex-wrap gap-2 mb-2 min-h-[40px]"></div><input id="inpPaidAddon" class="w-full text-xs p-2 border-b border-gray-200 focus:border-purple-500 outline-none bg-transparent" placeholder="Ex: Nutella=5..."></div>
                                 </div>
-
-                                <div>
-                                    <label class="text-xs font-bold text-gray-500 uppercase block mb-1">Taxa de Entrega (R$)</label>
-                                    <input type="number" id="cfgDeliveryFee" class="w-32 border rounded-lg p-2 text-sm font-bold" placeholder="0.00">
-                                </div>
+                                <div><label class="text-xs font-bold text-gray-500 uppercase block mb-1">Taxa de Entrega (R$)</label><input type="number" id="cfgDeliveryFee" class="w-32 border rounded-lg p-2 text-sm font-bold" placeholder="0.00"></div>
                             </div>
-
-                            <!-- STEP 3: ESTOQUE PICOLÉS -->
                             <div id="step-3" class="step-panel hidden flex flex-col h-full animate-fade-in">
                                 <div class="flex gap-4 mb-4 items-end bg-gray-50 p-4 rounded-xl border border-gray-200">
-                                    <div class="flex-1">
-                                        <label class="text-[10px] font-bold text-gray-500 uppercase">Nome do Produto</label>
-                                        <input id="prodName" class="w-full border-b-2 border-gray-300 bg-transparent py-1 text-sm focus:border-purple-500 outline-none" placeholder="Ex: Picolé de Coco">
-                                    </div>
-                                    <div class="w-24">
-                                        <label class="text-[10px] font-bold text-gray-500 uppercase">Preço</label>
-                                        <input id="prodPrice" type="number" class="w-full border-b-2 border-gray-300 bg-transparent py-1 text-sm focus:border-purple-500 outline-none" placeholder="0.00">
-                                    </div>
-                                    <button type="button" id="btnAddProduct" class="bg-green-500 text-white w-10 h-10 rounded-full hover:bg-green-600 shadow-md flex items-center justify-center transition transform hover:rotate-90">
-                                        <i class="fas fa-plus"></i>
-                                    </button>
+                                    <div class="flex-1"><label class="text-[10px] font-bold text-gray-500 uppercase">Nome do Produto</label><input id="prodName" class="w-full border-b-2 border-gray-300 bg-transparent py-1 text-sm focus:border-purple-500 outline-none" placeholder="Ex: Picolé de Coco"></div>
+                                    <div class="w-24"><label class="text-[10px] font-bold text-gray-500 uppercase">Preço</label><input id="prodPrice" type="number" class="w-full border-b-2 border-gray-300 bg-transparent py-1 text-sm focus:border-purple-500 outline-none" placeholder="0.00"></div>
+                                    <button type="button" id="btnAddProduct" class="bg-green-500 text-white w-10 h-10 rounded-full hover:bg-green-600 shadow-md flex items-center justify-center transition transform hover:rotate-90"><i class="fas fa-plus"></i></button>
                                 </div>
                                 <div id="productsListConfig" class="flex-1 overflow-y-auto grid grid-cols-3 gap-3 custom-scrollbar content-start p-1"></div>
                             </div>
-
-                            <!-- STEP 4: SISTEMA -->
                             <div id="step-4" class="step-panel hidden space-y-6 animate-fade-in">
                                 <div class="bg-slate-50 p-5 rounded-xl border border-slate-200 shadow-sm">
                                     <h4 class="text-sm font-bold text-slate-700 mb-4 flex items-center gap-2"><i class="fas fa-brain text-purple-500"></i> Inteligência Artificial (Gemini)</h4>
                                     <label class="block text-xs font-bold text-gray-400 mb-1">API KEY</label>
                                     <input type="password" id="cfgApiKey" class="w-full border rounded-lg p-3 text-sm bg-white focus:ring-2 focus:ring-purple-500 outline-none" placeholder="Cole sua chave aqui...">
                                 </div>
-
                                 <div class="bg-slate-50 p-5 rounded-xl border border-slate-200 shadow-sm">
                                     <h4 class="text-sm font-bold text-slate-700 mb-4 flex items-center gap-2"><i class="fas fa-print text-gray-600"></i> Impressão Térmica</h4>
                                     <div class="flex gap-3 mb-4">
@@ -5151,25 +4903,16 @@ ARQUIVO: /src/renderer/index.html
                                     </div>
                                 </div>
                             </div>
-
-                            <!-- FOOTER NAVEGAÇÃO -->
                             <div class="mt-auto pt-6 border-t border-gray-100 flex justify-between items-center">
-                                <button type="button" id="prev-step-btn" class="hidden text-gray-500 hover:text-gray-800 text-sm font-medium px-4 py-2 rounded-lg hover:bg-gray-100 transition">
-                                    <i class="fas fa-arrow-left mr-2"></i> Voltar
-                                </button>
+                                <button type="button" id="prev-step-btn" class="hidden text-gray-500 hover:text-gray-800 text-sm font-medium px-4 py-2 rounded-lg hover:bg-gray-100 transition"><i class="fas fa-arrow-left mr-2"></i> Voltar</button>
                                 <div class="flex gap-3 ml-auto">
-                                    <button type="button" id="next-step-btn" class="bg-slate-800 text-white px-8 py-3 rounded-lg hover:bg-slate-700 font-bold shadow-lg transition">
-                                        Próximo <i class="fas fa-arrow-right ml-2"></i>
-                                    </button>
-                                    <button type="submit" id="btnSaveConfig" class="hidden bg-purple-600 text-white px-8 py-3 rounded-lg hover:bg-purple-700 font-bold shadow-lg transition flex items-center gap-2">
-                                        <i class="fas fa-save"></i> Salvar Tudo
-                                    </button>
+                                    <button type="button" id="next-step-btn" class="bg-slate-800 text-white px-8 py-3 rounded-lg hover:bg-slate-700 font-bold shadow-lg transition">Próximo <i class="fas fa-arrow-right ml-2"></i></button>
+                                    <button type="submit" id="btnSaveConfig" class="hidden bg-purple-600 text-white px-8 py-3 rounded-lg hover:bg-purple-700 font-bold shadow-lg transition flex items-center gap-2"><i class="fas fa-save"></i> Salvar Tudo</button>
                                 </div>
                             </div>
                         </form>
                     </div>
                 </section>
-
             </main>
         </div>
     </div>
@@ -5184,28 +4927,13 @@ ARQUIVO: /src/renderer/index.html
             <h3 class="text-lg font-bold mb-4 text-gray-800 border-b pb-2">Editar Cliente</h3>
             <form id="editClientForm" class="space-y-4">
                 <input type="hidden" id="editClientId">
-                
                 <div class="flex gap-3">
                     <select id="editClientCountryCode" class="border rounded-lg p-2 bg-gray-50 w-24 text-sm"><option value="55">🇧🇷 +55</option></select>
                     <input type="text" id="editClientName" class="border rounded-lg p-2 flex-1 text-sm focus:border-purple-500 outline-none" placeholder="Nome">
                 </div>
-                
-                <div>
-                    <label class="block text-xs font-bold text-gray-400 uppercase mb-1">Telefone</label>
-                    <input type="text" id="editClientPhone" class="border rounded-lg p-2 w-full text-sm focus:border-purple-500 outline-none">
-                </div>
-
-                <!-- NOVO CAMPO EDITAR ENDEREÇO -->
-                <div>
-                    <label class="block text-xs font-bold text-gray-400 uppercase mb-1">Endereço Salvo</label>
-                    <input type="text" id="editClientAddress" class="border rounded-lg p-2 w-full text-sm focus:border-purple-500 outline-none" placeholder="Rua, Número...">
-                </div>
-                
-                <div class="bg-gray-50 p-3 rounded-lg border border-gray-100 mt-2">
-                    <p class="text-[10px] font-bold text-gray-400 mb-2 uppercase">Histórico Recente</p>
-                    <div id="clientAppointmentsHistory" class="text-xs text-gray-600 max-h-32 overflow-y-auto space-y-2 custom-scrollbar"></div>
-                </div>
-                
+                <div><label class="block text-xs font-bold text-gray-400 uppercase mb-1">Telefone</label><input type="text" id="editClientPhone" class="border rounded-lg p-2 w-full text-sm focus:border-purple-500 outline-none"></div>
+                <div><label class="block text-xs font-bold text-gray-400 uppercase mb-1">Endereço Salvo</label><input type="text" id="editClientAddress" class="border rounded-lg p-2 w-full text-sm focus:border-purple-500 outline-none" placeholder="Rua, Número..."></div>
+                <div class="bg-gray-50 p-3 rounded-lg border border-gray-100 mt-2"><p class="text-[10px] font-bold text-gray-400 mb-2 uppercase">Histórico Recente</p><div id="clientAppointmentsHistory" class="text-xs text-gray-600 max-h-32 overflow-y-auto space-y-2 custom-scrollbar"></div></div>
                 <div class="flex justify-end gap-3 pt-2">
                     <button type="button" id="cancelEditClientButton" class="px-4 py-2 text-gray-500 hover:bg-gray-100 rounded-lg text-sm font-medium transition">Cancelar</button>
                     <button type="submit" class="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 text-sm font-medium shadow-md transition">Salvar Alterações</button>
@@ -5221,47 +4949,21 @@ ARQUIVO: /src/renderer/index.html
                 <h3 class="text-lg font-bold text-gray-800">Detalhes do Pedido</h3>
                 <span id="modalStatusBadge" class="text-[10px] px-3 py-1 rounded-full bg-gray-100 text-gray-500 font-bold uppercase tracking-wider">STATUS</span>
             </div>
-            
             <form id="editOrderForm" class="space-y-4">
                 <input type="hidden" id="editOrderId">
-                
-                <div>
-                    <label class="block text-xs font-bold text-gray-400 uppercase mb-1">Itens do Pedido</label>
-                    <textarea id="editOrderItems" class="w-full border rounded-lg p-3 text-sm bg-gray-50 focus:bg-white focus:ring-2 focus:ring-purple-500 outline-none transition" rows="3"></textarea>
-                </div>
-                
+                <div><label class="block text-xs font-bold text-gray-400 uppercase mb-1">Itens do Pedido</label><textarea id="editOrderItems" class="w-full border rounded-lg p-3 text-sm bg-gray-50 focus:bg-white focus:ring-2 focus:ring-purple-500 outline-none transition" rows="3"></textarea></div>
                 <div class="flex gap-4">
-                    <div class="flex-1">
-                        <label class="block text-xs font-bold text-gray-400 uppercase mb-1">Total (R$)</label>
-                        <input type="number" step="0.50" id="editOrderTotal" class="w-full border rounded-lg p-2 text-sm font-bold text-gray-800">
-                    </div>
+                    <div class="flex-1"><label class="block text-xs font-bold text-gray-400 uppercase mb-1">Total (R$)</label><input type="number" step="0.50" id="editOrderTotal" class="w-full border rounded-lg p-2 text-sm font-bold text-gray-800"></div>
                     <div class="flex-1">
                         <label class="block text-xs font-bold text-gray-400 uppercase mb-1">Forma Pagamento</label>
-                        <select id="editOrderPayment" class="w-full border rounded-lg p-2 text-sm bg-white">
-                            <option value="Pix">Pix</option>
-                            <option value="Dinheiro">Dinheiro</option>
-                            <option value="Cartão">Cartão</option>
-                            <option value="A Combinar">A Combinar</option>
-                        </select>
+                        <select id="editOrderPayment" class="w-full border rounded-lg p-2 text-sm bg-white"><option value="Pix">Pix</option><option value="Dinheiro">Dinheiro</option><option value="Cartão">Cartão</option></select>
                     </div>
                 </div>
-
                 <div class="grid grid-cols-2 gap-4">
-                    <div>
-                        <label class="block text-xs font-bold text-gray-400 uppercase mb-1">Data Agendada</label>
-                        <input type="date" id="editOrderDate" class="w-full border rounded-lg p-2 text-sm">
-                    </div>
-                    <div>
-                        <label class="block text-xs font-bold text-gray-400 uppercase mb-1">Método Entrega</label>
-                        <input type="text" id="editOrderDelivery" class="w-full border rounded-lg p-2 text-sm">
-                    </div>
+                    <div><label class="block text-xs font-bold text-gray-400 uppercase mb-1">Data Agendada</label><input type="date" id="editOrderDate" class="w-full border rounded-lg p-2 text-sm"></div>
+                    <div><label class="block text-xs font-bold text-gray-400 uppercase mb-1">Método Entrega</label><input type="text" id="editOrderDelivery" class="w-full border rounded-lg p-2 text-sm"></div>
                 </div>
-
-                <div>
-                    <label class="block text-xs font-bold text-gray-400 uppercase mb-1">Endereço de Entrega</label>
-                    <input type="text" id="editOrderAddress" class="w-full border rounded-lg p-2 text-sm" placeholder="Rua, Número...">
-                </div>
-
+                <div><label class="block text-xs font-bold text-gray-400 uppercase mb-1">Endereço de Entrega</label><input type="text" id="editOrderAddress" class="w-full border rounded-lg p-2 text-sm" placeholder="Rua, Número..."></div>
                 <div class="flex justify-between items-center pt-4 border-t mt-4">
                     <div class="flex gap-2">
                         <button type="button" id="btnModalDelete" class="w-10 h-10 flex items-center justify-center text-red-400 hover:bg-red-50 rounded-lg transition" title="Excluir"><i class="fas fa-trash-alt"></i></button>
@@ -5271,6 +4973,55 @@ ARQUIVO: /src/renderer/index.html
                         <button type="button" id="cancelEditOrderButton" class="px-5 py-2 text-gray-500 hover:bg-gray-100 rounded-lg text-sm font-bold transition">Fechar</button>
                         <button type="submit" class="px-5 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 text-sm font-bold shadow-md transition transform active:scale-95">Salvar</button>
                     </div>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Modal Nova/Editar Encomenda (FESTAS) -->
+    <div id="encomendaModal" class="modal hidden">
+        <div class="modal-content max-w-2xl bg-white rounded-xl shadow-2xl">
+            <div class="flex justify-between items-center mb-4 border-b pb-3 p-4 bg-purple-50 rounded-t-xl">
+                <h3 class="text-lg font-bold text-purple-800"><i class="fas fa-glass-cheers mr-2"></i>Gestão de Encomenda (Festas)</h3>
+                <button id="closeEncomendaModal" class="text-gray-400 hover:text-red-500"><i class="fas fa-times"></i></button>
+            </div>
+            <form id="encomendaForm" class="p-6 space-y-4">
+                <input type="hidden" id="encId"> 
+                <div><label class="block text-xs font-bold text-gray-500 uppercase mb-1">Cliente</label><select id="encClientSelect" class="w-full border rounded-lg p-2 text-sm bg-white focus:ring-2 focus:ring-purple-500 outline-none"></select></div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div><label class="block text-xs font-bold text-gray-500 uppercase mb-1">Data do Evento</label><input type="date" id="encDate" required class="w-full border rounded-lg p-2 text-sm"></div>
+                    <div><label class="block text-xs font-bold text-gray-500 uppercase mb-1">Hora (Opcional)</label><input type="time" id="encTime" class="w-full border rounded-lg p-2 text-sm"></div>
+                </div>
+                <div><label class="block text-xs font-bold text-gray-500 uppercase mb-1">Itens do Pedido (Picolés/Potes)</label><textarea id="encItems" class="w-full border rounded-lg p-2 text-sm bg-gray-50 focus:bg-white transition" rows="2" placeholder="Ex: 50 Picolés Fruta, 30 Picolés Leite..."></textarea></div>
+                <div class="bg-orange-50 p-3 rounded-lg border border-orange-100">
+                    <label class="block text-xs font-bold text-orange-700 uppercase mb-1"><i class="fas fa-box-open mr-1"></i> Materiais Emprestados</label>
+                    <input type="text" id="encLoanedItems" class="w-full border border-orange-200 rounded-lg p-2 text-sm mb-2" placeholder="Ex: 1 Caixa Térmica, 2 Carrinhos...">
+                    <div class="flex items-center gap-2"><label class="text-xs font-bold text-gray-500">Data Devolução:</label><input type="date" id="encReturnDate" class="border rounded-lg p-1 text-sm bg-white"></div>
+                </div>
+                
+                <!-- AQUI ESTÁ A ALTERAÇÃO: 3 COLUNAS (TOTAL, PAGAMENTO, ENDEREÇO) -->
+                <div class="flex gap-4 items-end">
+                     <div class="w-1/3">
+                        <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Valor Total (R$)</label>
+                        <input type="number" step="0.50" id="encTotal" class="w-full border rounded-lg p-2 text-sm font-bold text-gray-800" placeholder="0.00">
+                    </div>
+                     <div class="w-1/3">
+                        <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Pagamento</label>
+                        <select id="encPayment" class="w-full border rounded-lg p-2 text-sm bg-white focus:border-purple-500 outline-none">
+                            <option value="Pix">Pix</option>
+                            <option value="Dinheiro">Dinheiro</option>
+                            <option value="Cartão">Cartão</option>
+                        </select>
+                    </div>
+                    <div class="flex-1">
+                        <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Endereço Entrega</label>
+                        <input type="text" id="encAddress" class="w-full border rounded-lg p-2 text-sm" placeholder="Opcional (Retirada)">
+                    </div>
+                </div>
+
+                <div class="flex justify-end gap-3 pt-4 border-t mt-2">
+                    <button type="button" id="btnDeleteEncomenda" class="hidden px-4 py-2 text-red-400 hover:bg-red-50 rounded-lg text-sm font-bold transition mr-auto">Excluir</button>
+                    <button type="submit" class="px-6 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 text-sm font-bold shadow-md transition transform active:scale-95">Salvar Encomenda</button>
                 </div>
             </form>
         </div>

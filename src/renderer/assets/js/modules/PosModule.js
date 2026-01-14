@@ -2,11 +2,13 @@ import { $, $$, show, hide } from '../utils/DOM.js';
 import { UI } from '../utils/UI.js';
 import { ProductService } from '../services/ProductService.js';
 import { ClientService } from '../services/ClientService.js';
+import { FirebaseService } from '../services/FirebaseService.js';
 
 export class PosModule {
     constructor() {
         this.productService = new ProductService();
         this.clientService = new ClientService();
+        this.db = FirebaseService.getInstance().db;
         
         this.products = [];
         this.cart = [];
@@ -20,6 +22,7 @@ export class PosModule {
         this.totalEl = $('posTotal');
         this.subtotalEl = $('posSubtotal');
         this.btnFinalize = $('btnPosFinalize');
+        this.btnCloseRegister = $('btnCloseRegister');
     }
 
     async init() {
@@ -33,7 +36,6 @@ export class PosModule {
     }
 
     destroy() {
-        // Remove listeners de teclado globais se necessário
         document.onkeydown = null;
     }
 
@@ -46,7 +48,6 @@ export class PosModule {
     }
 
     async loadClients() {
-        // Carrega lista simples para o select
         this.clientService.listenToClients((clients) => {
             this.clientSelect.innerHTML = '<option value="">Consumidor Final</option>';
             clients.forEach(c => {
@@ -59,14 +60,12 @@ export class PosModule {
     }
 
     setupEvents() {
-        // Busca em tempo real
         this.searchInput.oninput = (e) => {
             const term = e.target.value.toLowerCase();
             const filtered = this.products.filter(p => p.name.toLowerCase().includes(term));
             this.renderProducts(filtered);
         };
 
-        // Seleção de Método de Pagamento
         $$('.pos-pay-btn').forEach(btn => {
             btn.onclick = () => {
                 $$('.pos-pay-btn').forEach(b => b.classList.remove('bg-purple-600', 'border-purple-500'));
@@ -75,22 +74,127 @@ export class PosModule {
             };
         });
 
-        // Limpar Carrinho
         $('btnPosClear').onclick = () => {
             this.cart = [];
             this.renderCart();
         };
 
-        // Finalizar Venda
         this.btnFinalize.onclick = () => this.handleCheckout();
 
-        // Atalhos de Teclado
+        if (this.btnCloseRegister) {
+            this.btnCloseRegister.onclick = () => this.handleCloseRegister();
+        }
+
         document.onkeydown = (e) => {
             if (e.key === 'F10') {
                 e.preventDefault();
                 this.btnFinalize.click();
             }
         };
+    }
+
+    // --- NOVA LÓGICA: PRÉ-VISUALIZAÇÃO NA TELA ---
+    async handleCloseRegister() {
+        UI.toast('Calculando fechamento...');
+
+        try {
+            const { DateTime } = luxon;
+            const now = DateTime.now();
+            const startOfDay = now.startOf('day').toJSDate();
+            const endOfDay = now.endOf('day').toJSDate();
+
+            // Busca pedidos válidos do dia
+            const snapshot = await this.db.collection('orders')
+                .where('createdAt', '>=', startOfDay)
+                .where('createdAt', '<=', endOfDay)
+                .get();
+
+            const summary = {
+                date: now.toFormat('dd/MM/yyyy HH:mm'),
+                total: 0,
+                count: 0,
+                methods: { 'Pix': 0, 'Dinheiro': 0, 'Cartão': 0, 'Outros': 0 }
+            };
+
+            snapshot.forEach(doc => {
+                const data = doc.data();
+                if (data.status === 'Cancelado') return; // Ignora cancelados
+
+                const val = parseFloat(data.total || 0);
+                summary.total += val;
+                summary.count++;
+
+                let method = data.paymentMethod || 'Outros';
+                // Normaliza (ex: pix -> Pix)
+                method = method.charAt(0).toUpperCase() + method.slice(1).toLowerCase();
+                
+                if (summary.methods[method] !== undefined) {
+                    summary.methods[method] += val;
+                } else {
+                    summary.methods['Outros'] += val;
+                }
+            });
+
+            // GERA HTML DO CUPOM PARA VISUALIZAÇÃO
+            const cupomHtml = `
+                <div class="bg-yellow-50 border border-yellow-200 p-4 font-mono text-sm text-gray-800 shadow-inner rounded mb-4">
+                    <div class="text-center border-b border-dashed border-gray-400 pb-2 mb-2">
+                        <h3 class="font-bold text-lg">FECHAMENTO DE CAIXA</h3>
+                        <p class="text-xs">${summary.date}</p>
+                    </div>
+                    
+                    <div class="flex justify-between mb-1"><span>Qtd Pedidos:</span> <span>${summary.count}</span></div>
+                    <div class="border-b border-dashed border-gray-300 my-2"></div>
+
+                    <div class="flex justify-between"><span>Pix:</span> <span>R$ ${summary.methods.Pix.toFixed(2)}</span></div>
+                    <div class="flex justify-between"><span>Dinheiro:</span> <span>R$ ${summary.methods.Dinheiro.toFixed(2)}</span></div>
+                    <div class="flex justify-between"><span>Cartão:</span> <span>R$ ${summary.methods.Cartão.toFixed(2)}</span></div>
+                    ${summary.methods.Outros > 0 ? `<div class="flex justify-between text-gray-500"><span>Outros:</span> <span>R$ ${summary.methods.Outros.toFixed(2)}</span></div>` : ''}
+
+                    <div class="border-t border-dashed border-gray-800 mt-3 pt-2">
+                        <div class="flex justify-between font-bold text-lg">
+                            <span>TOTAL:</span>
+                            <span>R$ ${summary.total.toFixed(2)}</span>
+                        </div>
+                    </div>
+                </div>
+                <p class="text-center text-xs text-gray-500 mb-4">Confira os valores antes de imprimir.</p>
+            `;
+
+            // ABRE MODAL DE DECISÃO
+            UI._createModal(`
+                <h3 class="text-lg font-bold text-gray-800 mb-2">Conferência de Caixa</h3>
+                ${cupomHtml}
+                <div class="flex flex-col gap-2">
+                    <button id="btnPrintConfirm" class="w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-3 rounded-lg shadow-lg flex justify-center items-center gap-2">
+                        <i class="fas fa-print"></i> CONFIRMAR E IMPRIMIR
+                    </button>
+                    <button id="btnCancelClose" class="w-full bg-white border border-gray-300 text-gray-700 font-bold py-2 rounded-lg hover:bg-gray-50">
+                        Apenas Fechar (Não Imprimir)
+                    </button>
+                </div>
+            `, async (card, close) => {
+                
+                // Botão IMPRIMIR
+                card.querySelector('#btnPrintConfirm').onclick = async () => {
+                    close();
+                    UI.toast('Enviando para impressora...');
+                    const res = await window.electronAPI.printCloseRegister(summary);
+                    if (!res.success) {
+                        UI.alert('Erro Impressão', res.error || 'Verifique se a impressora está ligada e selecionada nas Configurações.');
+                    } else {
+                        UI.toast('Relatório impresso com sucesso!', 'success');
+                    }
+                };
+
+                // Botão FECHAR
+                card.querySelector('#btnCancelClose').onclick = () => close();
+            });
+
+        } catch (e) {
+            console.error(e);
+            UI.alert('Erro', 'Falha ao processar fechamento: ' + e.message);
+        }
     }
 
     renderProducts(list) {
@@ -170,7 +274,6 @@ export class PosModule {
         this.totalEl.innerText = `R$ ${total.toFixed(2)}`;
         this.subtotalEl.innerText = `R$ ${total.toFixed(2)}`;
         
-        // Auto-scroll
         this.cartList.scrollTop = this.cartList.scrollHeight;
     }
 
@@ -211,7 +314,7 @@ export class PosModule {
             deliveryMethod: 'Balcão',
             status: 'Concluído',
             notes: 'Venda Rápida POS',
-            cart: this.cart.map(i => ({ id: i.id, qty: i.quantity })) // Formato para o DatabaseService
+            cart: this.cart.map(i => ({ id: i.id, qty: i.quantity })) 
         };
 
         this.btnFinalize.disabled = true;
@@ -222,7 +325,6 @@ export class PosModule {
             if (res.success) {
                 UI.toast('Venda finalizada com sucesso!', 'success');
                 
-                // Pergunta se quer imprimir
                 const print = await UI.confirm('Sucesso!', 'Deseja imprimir o cupom?', 'Imprimir', 'blue');
                 if (print) {
                     await window.electronAPI.printOrder({ ...orderData, id: res.orderId });
@@ -230,7 +332,7 @@ export class PosModule {
 
                 this.cart = [];
                 this.renderCart();
-                await this.loadProducts(); // Recarrega estoque visualmente
+                await this.loadProducts(); 
             } else {
                 UI.alert('Erro na Venda', res.error);
             }

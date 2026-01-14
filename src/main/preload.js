@@ -48,4 +48,5 @@ contextBridge.exposeInMainWorld('electronAPI', {
   createScheduledOrder: (data) => ipcRenderer.invoke('create-scheduled-order', data),
   updateScheduledOrder: (data) => ipcRenderer.invoke('update-scheduled-order', data),
   deleteScheduledOrder: (id) => ipcRenderer.invoke('delete-scheduled-order', id),
+  printCloseRegister: (data) => ipcRenderer.invoke('print-close-register', data),
 });
