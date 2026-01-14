@@ -224,53 +224,110 @@
             <!-- Main Scrollable Area -->
             <main class="flex-1 overflow-y-auto p-6 scroll-smooth custom-scrollbar relative">
                 
-                <!-- 1. DASHBOARD -->
+                <!-- 1. DASHBOARD (Raio-X do Dia) -->
                 <section id="sectionDashboard" class="content-section">
-                    <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-                        <!-- Card Pedidos -->
-                        <div id="dashCardOrders" class="bg-white p-6 rounded-2xl shadow-sm border border-purple-100 flex justify-between items-center cursor-pointer hover:shadow-md transition">
+                    
+                    <!-- Cabeçalho do Dia -->
+                    <div class="mb-2 flex items-center gap-2">
+                        <div class="bg-purple-600 text-white w-8 h-8 rounded-lg flex items-center justify-center shadow-sm">
+                            <i class="fas fa-calendar-day"></i>
+                        </div>
+                        <div>
+                            <h3 class="text-sm font-bold text-gray-700 uppercase tracking-wide">Resumo de Hoje</h3>
+                            <p class="text-[10px] text-gray-400 font-mono" id="dashTodayDate">Carregando data...</p>
+                        </div>
+                    </div>
+
+                    <!-- GRID DE CARDS (4 Colunas) -->
+                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                        
+                        <!-- 1. Faturamento Hoje -->
+                        <div class="bg-white p-4 rounded-xl shadow-sm border-l-4 border-emerald-500 flex justify-between items-center transition hover:shadow-md">
                             <div>
-                                <p class="text-xs font-bold text-gray-400 uppercase tracking-wide">Pedidos Abertos</p>
-                                <h3 class="text-3xl font-black text-gray-800 mt-1" id="dashOpenOrders">0</h3>
+                                <p class="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Vendido Hoje</p>
+                                <h3 class="text-2xl font-black text-gray-800 mt-1" id="dashTodayRevenue">R$ 0,00</h3>
                             </div>
-                            <div class="w-12 h-12 bg-purple-50 rounded-xl flex items-center justify-center text-purple-600">
-                                <i class="fas fa-receipt text-xl"></i>
+                            <div class="w-10 h-10 rounded-full bg-emerald-50 flex items-center justify-center text-emerald-600">
+                                <i class="fas fa-dollar-sign text-lg"></i>
                             </div>
                         </div>
 
-                        <!-- Card Clientes -->
-                        <div id="dashCardClients" class="bg-white p-6 rounded-2xl shadow-sm border border-emerald-100 flex justify-between items-center cursor-pointer hover:shadow-md transition">
+                        <!-- 2. Qtd Pedidos Hoje -->
+                        <div class="bg-white p-4 rounded-xl shadow-sm border-l-4 border-blue-500 flex justify-between items-center transition hover:shadow-md">
                             <div>
-                                <p class="text-xs font-bold text-gray-400 uppercase tracking-wide">Clientes Totais</p>
-                                <h3 class="text-3xl font-black text-gray-800 mt-1" id="dashTotalClients">0</h3>
+                                <p class="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Pedidos Hoje</p>
+                                <h3 class="text-2xl font-black text-gray-800 mt-1" id="dashTodayCount">0</h3>
                             </div>
-                            <div class="w-12 h-12 bg-emerald-50 rounded-xl flex items-center justify-center text-emerald-600">
-                                <i class="fas fa-users text-xl"></i>
+                            <div class="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center text-blue-600">
+                                <i class="fas fa-shopping-bag text-lg"></i>
                             </div>
                         </div>
 
-                        <!-- Card Bot Status (CIANO/GELO) -->
-                        <div id="dashCardStatus" class="bg-white p-6 rounded-2xl shadow-sm border border-cyan-100 flex justify-between items-center cursor-pointer hover:shadow-md transition">
+                        <!-- 3. Ticket Médio Hoje -->
+                        <div class="bg-white p-4 rounded-xl shadow-sm border-l-4 border-purple-500 flex justify-between items-center transition hover:shadow-md">
                             <div>
-                                <p class="text-xs font-bold text-gray-400 uppercase tracking-wide">IA / WhatsApp</p>
-                                <h3 class="text-xl font-bold text-gray-800 mt-2" id="dashNextSlot">Verificando...</h3>
+                                <p class="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Ticket Médio</p>
+                                <h3 class="text-2xl font-black text-gray-800 mt-1" id="dashTodayTicket">R$ 0,00</h3>
                             </div>
-                            <div class="w-12 h-12 bg-cyan-50 rounded-xl flex items-center justify-center text-cyan-600 animate-pulse">
-                                <i class="fas fa-robot text-xl"></i>
+                            <div class="w-10 h-10 rounded-full bg-purple-50 flex items-center justify-center text-purple-600">
+                                <i class="fas fa-chart-line text-lg"></i>
+                            </div>
+                        </div>
+
+                        <!-- 4. Fila / Pendentes (Operacional) -->
+                        <div id="dashCardOrders" class="bg-white p-4 rounded-xl shadow-sm border-l-4 border-yellow-400 flex justify-between items-center cursor-pointer hover:bg-yellow-50 transition" onclick="document.getElementById('navPedidos').click()">
+                            <div>
+                                <p class="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Fila / Pendentes</p>
+                                <h3 class="text-2xl font-black text-yellow-600 mt-1 animate-pulse" id="dashOpenOrders">0</h3>
+                            </div>
+                            <div class="w-10 h-10 rounded-full bg-yellow-100 flex items-center justify-center text-yellow-600">
+                                <i class="fas fa-clock text-lg"></i>
                             </div>
                         </div>
                     </div>
 
-                    <!-- Gráfico -->
-                    <div class="bg-white p-6 rounded-2xl shadow-sm border border-purple-100">
-                        <div class="flex justify-between items-center mb-6">
-                            <div>
-                                <h3 class="text-lg font-bold text-gray-800">Fluxo de Vendas</h3>
-                                <p class="text-xs text-gray-400">Últimos 7 dias</p>
+                    <!-- Layout Dividido: Gráfico (2/3) + Agenda (1/3) -->
+                    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 h-[calc(100%-140px)]">
+                        
+                        <!-- Coluna Esquerda: Gráfico -->
+                        <div class="lg:col-span-2 bg-white p-5 rounded-2xl shadow-sm border border-gray-100 flex flex-col">
+                            <div class="flex justify-between items-center mb-4">
+                                <div>
+                                    <h3 class="font-bold text-gray-800">Desempenho da Semana</h3>
+                                    <p class="text-xs text-gray-400">Comparativo últimos 7 dias</p>
+                                </div>
+                                <button class="text-xs text-purple-600 font-bold bg-purple-50 px-3 py-1 rounded hover:bg-purple-100 transition" onclick="document.getElementById('navRelatorios').click()">
+                                    Ver Detalhes <i class="fas fa-arrow-right ml-1"></i>
+                                </button>
+                            </div>
+                            <div class="relative flex-1 w-full min-h-[250px]">
+                                <canvas id="salesChart"></canvas>
                             </div>
                         </div>
-                        <div class="relative w-full h-80">
-                            <canvas id="salesChart"></canvas>
+
+                        <!-- Coluna Direita: Agenda do Dia -->
+                        <div class="bg-white p-5 rounded-2xl shadow-sm border border-gray-100 flex flex-col overflow-hidden relative">
+                            <!-- Cabeçalho Agenda -->
+                            <div class="flex justify-between items-center mb-4 border-b border-gray-50 pb-2">
+                                <h3 class="font-bold text-gray-800 flex items-center gap-2">
+                                    <i class="fas fa-calendar-check text-orange-500"></i> Encomendas Hoje
+                                </h3>
+                                <span class="text-[10px] bg-gray-100 text-gray-500 px-2 py-0.5 rounded font-bold">HOJE</span>
+                            </div>
+
+                            <!-- Lista Scrollável -->
+                            <div id="dashTodaySchedule" class="flex-1 overflow-y-auto custom-scrollbar space-y-3 pr-1">
+                                <!-- O JavaScript vai injetar os itens aqui ou a mensagem de vazio -->
+                                <div class="flex flex-col items-center justify-center h-full text-gray-300 opacity-60">
+                                    <i class="fas fa-mug-hot text-3xl mb-2"></i>
+                                    <p class="text-xs">Carregando agenda...</p>
+                                </div>
+                            </div>
+
+                            <!-- Botão Rápido -->
+                            <button onclick="document.getElementById('navEncomendas').click()" class="mt-4 w-full py-2 bg-orange-50 text-orange-600 text-xs font-bold rounded-lg hover:bg-orange-100 transition border border-orange-200">
+                                Ver Calendário Completo
+                            </button>
                         </div>
                     </div>
                 </section>

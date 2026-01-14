@@ -1,5 +1,5 @@
 CONTEXTO DO PROJETO (CÓDIGO FONTE)
-Data da geração: 14/01/2026, 02:20:20
+Data da geração: 14/01/2026, 04:47:25
 
 ================================================================================
 ARQUIVO: /package.json
@@ -109,12 +109,10 @@ const { ipcMain, BrowserWindow, app } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
-// Importando nossos serviços
 const DatabaseService = require('../services/DatabaseService');
 const AIService = require('../services/AIService');
 const WhatsappService = require('../services/WhatsappService');
 
-// Delay para evitar respostas picotadas da IA (Debounce)
 const AI_REPLY_DELAY = 15000; 
 
 class AppController {
@@ -123,54 +121,34 @@ class AppController {
         this.db = new DatabaseService(dbInstance);
         this.ai = new AIService();
         
-        // Configuração de caminhos do WhatsApp
         const isDev = !app.isPackaged;
         const resourcePath = isDev ? path.join(__dirname, '../../../') : process.resourcesPath;
         const sessionPath = path.join(resourcePath, 'whatsapp_session');
         const chromePath = isDev ? undefined : path.join(resourcePath, 'chrome-bin', 'chrome-win64', 'chrome.exe');
         
         this.wa = new WhatsappService(sessionPath, chromePath, isDev);
-        
-        // Buffers para debounce de mensagens
         this.messageBuffers = new Map();
-        
-        this.workerWindow = null; // Para impressão silenciosa
+        this.workerWindow = null; 
     }
 
     async initialize() {
-        console.log('[Controller] Inicializando sistema Doce Floco (V6.1 - Delivery Inteligente)...');
-
-        // 1. Carregar Configurações do Banco
+        console.log('[Controller] Inicializando sistema Doce Floco (V6.5 - Correção Estoque/Crash)...');
         const storeConfig = await this.db.getStoreConfig();
-        
-        // 2. Inicializar IA com a Key do Banco
         if (storeConfig.geminiApiKey) {
             this.ai.init(storeConfig.geminiApiKey);
             this.ai.updateConfig(storeConfig);
         }
-
-        // 3. Inicializar Listeners do WhatsApp
         this._setupWhatsappListeners();
-
-        // 4. Configurar IPC (Comunicação com o Frontend)
         this._setupIpcHandlers();
-        
-        // 5. Iniciar WhatsApp Automaticamente
         console.log('[Controller] Iniciando conexão automática do WhatsApp...');
         this.wa.initialize(); 
-        
         console.log('[Controller] Sistema pronto.');
     }
 
     _setupWhatsappListeners() {
-        // Redireciona eventos do Serviço WA para a Janela do Electron
         this.wa.on('qr', (qr) => this.mainWindow.webContents.send('whatsapp-qr', qr));
         this.wa.on('status', (status) => this.mainWindow.webContents.send('whatsapp-status', status));
-        
-        // Lógica Central: Recebimento de Mensagem
-        this.wa.on('message', async (message) => {
-            await this._handleIncomingMessage(message);
-        });
+        this.wa.on('message', async (message) => { await this._handleIncomingMessage(message); });
     }
 
     async _handleIncomingMessage(message) {
@@ -184,7 +162,6 @@ class AppController {
             let body = message.body;
             let isAudio = false;
 
-            // Tratamento de Áudio
             if (message.type === 'ptt' || message.type === 'audio') {
                 isAudio = true;
                 const media = await message.downloadMedia();
@@ -194,7 +171,6 @@ class AppController {
                 return; 
             }
 
-            // Lógica de Detecção de Resposta (Quoted Message)
             let quotedContext = null;
             if (message.hasQuotedMsg) {
                 try {
@@ -217,8 +193,6 @@ class AppController {
             });
 
             if (client.aiPaused) return;
-
-            // Passamos para a fila de debounce
             this._queueAutoReply(message.from, client, body, quotedContext);
 
         } catch (error) {
@@ -230,37 +204,85 @@ class AppController {
         if (this.messageBuffers.has(chatId)) {
             const existing = this.messageBuffers.get(chatId);
             clearTimeout(existing.timer);
-            
             existing.text += " " + text;
             if (quotedContext) existing.quotedContext = quotedContext;
-
             existing.timer = setTimeout(() => {
                 this._processAiReply(chatId, client, existing.text, existing.quotedContext);
                 this.messageBuffers.delete(chatId);
             }, AI_REPLY_DELAY);
-            
             this.messageBuffers.set(chatId, existing);
         } else {
             const timer = setTimeout(() => {
                 this._processAiReply(chatId, client, text, quotedContext);
                 this.messageBuffers.delete(chatId);
             }, AI_REPLY_DELAY);
-            
             this.messageBuffers.set(chatId, { timer, text, quotedContext });
         }
     }
 
+    /**
+     * MELHORADO: Parser de Produtos para Baixa de Estoque
+     * Agora aceita "Picolé Coco" sem número (assume 1) e é case-insensitive
+     */
+    _matchProductsFromText(textItems, allProducts) {
+        if (!textItems || typeof textItems !== 'string') return [];
+        const cart = [];
+        
+        // Separa linhas ou vírgulas
+        const lines = textItems.split(/[\n,]/);
+        
+        lines.forEach(line => {
+            let clean = line.trim();
+            if (!clean) return;
+
+            // Remove hífens no início (ex: "- Picolé")
+            clean = clean.replace(/^-\s*/, '');
+
+            // Regex tenta achar número no começo. 
+            // Ex: "2x Coca" -> qty=2, name="Coca"
+            // Ex: "Coca" -> match null -> qty=1, name="Coca"
+            const match = clean.match(/^(\d+)\s*[xX]?\s*(.+)$/);
+            
+            let qty = 1;
+            let searchName = clean.toLowerCase();
+
+            if (match) {
+                qty = parseInt(match[1]);
+                searchName = match[2].trim().toLowerCase();
+            }
+
+            // Busca produto na lista (Case Insensitive)
+            // Tenta match exato ou parcial
+            const product = allProducts.find(p => {
+                const pName = p.name.toLowerCase();
+                return pName === searchName || pName.includes(searchName) || searchName.includes(pName);
+            });
+            
+            if (product) {
+                cart.push({ id: product.id, qty: qty, name: product.name });
+            }
+        });
+        
+        if(cart.length > 0) console.log(`[Estoque] Itens identificados para baixa: ${cart.length}`);
+        return cart;
+    }
+
     async _processAiReply(chatId, client, userText, quotedContext = null) {
         try {
-            // Contexto rico para a IA
             const history = await this.db.getClientHistory(client.id);
             const chatRecent = await this.db.getRecentChat(client.id);
-            const productsData = await this.db.getActiveProducts(); // Vitrine de Picolés/Estoque
+            
+            // Carrega produtos para o parser de estoque
+            const productsSnapshot = await this.db.db.collection('products').where('active', '==', true).get();
+            const allProducts = productsSnapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+            
+            const productsData = await this.db.getActiveProducts();
+            
+            // Anti-Duplicidade
+            const activeOrder = await this.db.getLastPendingOrder(client.id);
             
             const { DateTime } = require('luxon');
             const today = DateTime.now().setLocale('pt-BR');
-            
-            // Endereço conhecido para o contexto
             const lastAddress = client.lastAddress || null;
 
             const context = {
@@ -271,15 +293,13 @@ class AppController {
                 todayDate: today.toFormat('dd/MM/yyyy'),
                 dayName: today.toFormat('cccc'),
                 forcedContext: quotedContext,
-                lastAddress // Contexto de entrega
+                lastAddress,
+                activeOrder: activeOrder ? { shortId: activeOrder.shortId, items: activeOrder.items, total: activeOrder.total } : null
             };
 
-            // GERA RESPOSTA DA IA
             const response = await this.ai.generateSalesResponse(context, userText);
-            
             let finalReply = response.text;
             
-            // EXECUTA COMANDO JSON (Se houver)
             if (response.command) {
                 const cmd = response.command;
                 console.log(`[IA Action] Executando: ${cmd.type}`);
@@ -288,7 +308,6 @@ class AppController {
 
                 switch (cmd.type) {
                     case 'schedule_order':
-                        // Encomendas grandes ou futuras
                         result = await this.db.createScheduledOrder({ ...cmd, clientId: client.id, clientName: client.name });
                         if (result.success && !finalReply) {
                             finalReply = `🗓️ Agendado para ${cmd.date.split('-').reverse().join('/')}!`;
@@ -296,63 +315,50 @@ class AppController {
                         break;
                         
                     case 'create_order':
-                        // 1. Gera ID Curto (4 últimos dígitos do timestamp)
                         const shortId = Date.now().toString().slice(-4);
-
-                        // 2. Salva endereço se for entrega
                         if (cmd.method === 'Entrega' && cmd.address) {
                             await this.db.updateDocument('clients', client.id, { lastAddress: cmd.address });
                         }
+                        
+                        // TENTA IDENTIFICAR PRODUTOS PARA BAIXA DE ESTOQUE
+                        const computedCart = this._matchProductsFromText(cmd.items, allProducts);
 
-                        // 3. Cria Pedido
                         result = await this.db.createStandardOrder({ 
                             ...cmd, 
                             clientId: client.id, 
                             clientName: client.name,
-                            shortId: shortId // Passa o ID
+                            shortId: shortId,
+                            cart: computedCart // IMPORTANTE: Passa o carrinho
                         });
                         
                         if (result.success) {
                             if (!finalReply) finalReply = `📝 Pedido #${shortId} confirmado! Total: R$ ${cmd.total}.`;
                             const conf = await this.db.getStoreConfig();
-                            
-                            // DISPARA IMPRESSÃO AUTOMÁTICA
                             if (conf.autoPrint && conf.printerName) {
-                                this._printOrder(result.orderId, { 
-                                    ...result, 
-                                    items: cmd.items, 
-                                    clientName: client.name,
-                                    total: cmd.total,
-                                    deliveryMethod: cmd.method,
-                                    address: cmd.address || 'Retirada',
-                                    paymentMethod: cmd.payment || 'A Combinar',
-                                    shortId: shortId // Passa ID para o cupom
-                                });
+                                this._printOrder(result.orderId, { ...result, items: cmd.items, clientName: client.name, total: cmd.total, deliveryMethod: cmd.method, address: cmd.address || 'Retirada', paymentMethod: cmd.payment || 'A Combinar', shortId: shortId });
                             }
                         } else {
                             if (result.error && result.error.includes('Estoque insuficiente')) {
-                                finalReply = "⚠️ Ops! Mil desculpas, mas o último item acabou de ser vendido. 😔 Posso oferecer outra opção?";
+                                finalReply = "⚠️ Ops! Acabei de conferir e algum item acabou de esgotar. 😔";
                             }
                         }
                         break;
 
                     case 'update_order':
                     case 'update_last_order':
-                        // 1. Tenta buscar pelo ID específico ou pega o último pendente
                         let orderDoc = null;
                         
                         if (cmd.orderId) {
-                            // Se a IA mandou o ID (ex: "4590"), busca no banco
-                            // Precisamos garantir que DatabaseService tenha esse método, 
-                            // ou fazemos a query manual aqui para garantir:
-                            const qCheck = await this.db.db.collection('orders')
-                                .where('shortId', '==', String(cmd.orderId))
-                                .limit(1)
-                                .get();
+                            const qCheck = await this.db.db.collection('orders').where('shortId', '==', String(cmd.orderId)).limit(1).get();
                             if (!qCheck.empty) orderDoc = qCheck.docs[0];
                         }
 
-                        // Fallback: Se não achou por ID, pega o último do cliente
+                        // Fallback: Se não achou pelo ID, tenta pelo pedido ativo na memória
+                        if (!orderDoc && activeOrder) {
+                             orderDoc = await this.db.db.collection('orders').doc(activeOrder.id).get();
+                        }
+                        
+                        // Fallback 2: Busca no banco
                         if (!orderDoc) {
                             const lastOrders = await this.db.db.collection('orders')
                                 .where('clientId', '==', client.id)
@@ -365,9 +371,10 @@ class AppController {
                         
                         if (orderDoc) {
                             const updates = {};
-                            let logMsg = "Pedido Atualizado";
+                            
+                            // CORREÇÃO DO ERRO ReferenceError: logMsg DEFINIDA AQUI
+                            let logMsg = "Pedido Atualizado"; 
 
-                            // Atualiza Endereço
                             if (cmd.newAddress || cmd.address) {
                                 const addr = cmd.newAddress || cmd.address;
                                 updates.address = addr;
@@ -375,7 +382,6 @@ class AppController {
                                 logMsg = "Endereço Atualizado";
                             }
                             
-                            // Atualiza Itens (Se a IA mandar)
                             if (cmd.newItems) {
                                 updates.items = cmd.newItems;
                                 if(cmd.newTotal) updates.total = cmd.newTotal;
@@ -386,12 +392,10 @@ class AppController {
 
                             await orderDoc.ref.update(updates);
 
-                            // REIMPRESSÃO COM NOVOS DADOS
                             const conf = await this.db.getStoreConfig();
                             if (conf.autoPrint && conf.printerName) {
                                 const updatedData = { ...orderDoc.data(), ...updates };
                                 this._printOrder(orderDoc.id, updatedData);
-                                console.log('[Update] Pedido atualizado e reimpresso.');
                             }
 
                             const displayId = orderDoc.data().shortId || '...';
@@ -412,15 +416,11 @@ class AppController {
                 }
             }
 
-            // Envia Resposta Final (Texto)
             if (finalReply.trim()) {
                 await this.wa.sendText(chatId, finalReply);
-                await this.db.logMessage(client.id, {
-                    chatId, fromMe: true, body: finalReply, isAutoReply: true
-                });
+                await this.db.logMessage(client.id, { chatId, fromMe: true, body: finalReply, isAutoReply: true });
             }
 
-            // Ações Especiais de Mídia
             if (response.specialActions) {
                 if (response.specialActions.sendAcaiMenu) {
                     const config = await this.db.getStoreConfig();
@@ -437,7 +437,8 @@ class AppController {
             console.error('[Controller] Erro processamento IA:', error);
         }
     }
-
+    
+    
     async _sendDailyShowcase(chatId) {
         try {
             const snap = await this.db.db.collection('products')
@@ -452,11 +453,8 @@ class AppController {
                     itemsToSend.push({ name: p.name, price: p.price, path: p.imagePath, qty: p.quantity });
                 }
             });
-
             if (itemsToSend.length === 0) return { success: false };
-
             await this.wa.sendText(chatId, `📸 *Vitrine de Hoje:*`);
-            
             for (const item of itemsToSend) {
                 if (!fs.existsSync(item.path)) continue;
                 await new Promise(r => setTimeout(r, 4000));
@@ -465,7 +463,6 @@ class AppController {
                     await this.wa.sendImage(chatId, item.path, caption);
                 } catch (e) {}
             }
-            
             await new Promise(r => setTimeout(r, 2000));
             await this.wa.sendText(chatId, "😋 Escolheu? É só me falar o nome!");
             return { success: true };
@@ -476,12 +473,10 @@ class AppController {
     }
 
     _setupIpcHandlers() {
-        // --- WHATSAPP ---
         ipcMain.handle('get-whatsapp-qr', () => null);
         ipcMain.handle('get-whatsapp-status', () => this.wa.status);
         ipcMain.handle('whatsapp-initialize', () => { this.wa.initialize(); return { success: true }; });
         ipcMain.handle('whatsapp-logout', async () => { await this.wa.logout(); return { success: true }; });
-        
         ipcMain.handle('send-whatsapp-message', async (e, rawPhone, msg) => { 
             const success = await this.wa.sendText(rawPhone, msg);
             if (success) {
@@ -489,28 +484,18 @@ class AppController {
                     const cleanPhone = rawPhone.replace(/\D/g, '');
                     const client = await this.db.getOrCreateClient(cleanPhone);
                     if (client && client.id) {
-                        await this.db.logMessage(client.id, {
-                            chatId: rawPhone.includes('@c.us') ? rawPhone : `${cleanPhone}@c.us`,
-                            fromMe: true, body: msg, content: msg, isAutomated: false
-                        });
+                        await this.db.logMessage(client.id, { chatId: rawPhone.includes('@c.us') ? rawPhone : `${cleanPhone}@c.us`, fromMe: true, body: msg, content: msg, isAutomated: false });
                     }
                 } catch (e) {}
             }
             return { success }; 
         });
 
-        // Handler para Envio de Imagens
-        ipcMain.handle('send-product-image', async (e, { chatId, imagePath, caption }) => {
-            const success = await this.wa.sendImage(chatId, imagePath, caption);
-            return { success };
-        });
+        ipcMain.handle('send-product-image', async (e, { chatId, imagePath, caption }) => { const success = await this.wa.sendImage(chatId, imagePath, caption); return { success }; });
 
-        // Handler para Selecionar Imagem do Computador
         ipcMain.handle('select-product-image', async (e, productId) => {
             const { dialog } = require('electron');
-            const result = await dialog.showOpenDialog(this.mainWindow, {
-                properties: ['openFile'], filters: [{ name: 'Imagens', extensions: ['jpg', 'png', 'jpeg', 'webp'] }]
-            });
+            const result = await dialog.showOpenDialog(this.mainWindow, { properties: ['openFile'], filters: [{ name: 'Imagens', extensions: ['jpg', 'png', 'jpeg', 'webp'] }] });
             if (result.canceled || result.filePaths.length === 0) return { success: false };
             try {
                 const sourcePath = result.filePaths[0];
@@ -539,11 +524,7 @@ class AppController {
             } catch (err) { return { success: false, error: err.message }; }
         });
 
-        // --- ENCOMENDAS & PEDIDOS ---
-        
-        // ** NOVA FUNÇÃO DE CRIAÇÃO DE ENCOMENDA MANUAL **
         ipcMain.handle('create-scheduled-order', async (e, data) => await this.db.createScheduledOrder(data));
-        
         ipcMain.handle('get-scheduled-orders', async () => await this.db.getScheduledOrders());
         ipcMain.handle('get-client-appointments', async (e, clientId) => await this.db.getClientAppointments(clientId));
         ipcMain.handle('delete-order', async (e, id) => await this.db.deleteDocument('orders', id));
@@ -552,8 +533,6 @@ class AppController {
         ipcMain.handle('update-order-status', async (e, { orderId, newStatus, shouldNotify, orderData }) => {
             const res = await this.db.updateDocument('orders', orderId, { status: newStatus });
             if (!res.success) return res;
-            
-            // --- ATUALIZAÇÃO: NOTIFICAÇÃO + LOG NO CHAT ---
             if (shouldNotify && this.wa.status === 'conectado') {
                 try {
                     const clientDoc = await this.db.db.collection('clients').doc(orderData.clientId).get();
@@ -562,39 +541,24 @@ class AppController {
                         let message = "";
                         const method = (orderData.deliveryMethod || "").toLowerCase();
                         const isDelivery = method.includes('entrega') || method.includes('delivery');
-
                         switch (newStatus) {
                             case 'Preparo': message = `👩‍🍳 Olá ${orderData.clientName}! Seu pedido está sendo preparado! 🍦`; break;
                             case 'Pronto/Envio': message = isDelivery ? `🛵 Saiu para entrega!` : `🎁 Pronto para retirada!`; break;
                             case 'Concluído': message = `💜 Pedido finalizado! Obrigado!`; break;
                         }
-                        
                         if (message) {
-                            // 1. Envia no WhatsApp
                             const sent = await this.wa.sendText(phone, message);
-                            
-                            // 2. [CRÍTICO] Loga no Chat do Sistema se enviou
                             if (sent) {
                                 const chatId = phone.includes('@') ? phone : `${phone.replace(/\D/g,'')}@c.us`;
-                                await this.db.logMessage(orderData.clientId, {
-                                    chatId: chatId,
-                                    fromMe: true,
-                                    body: message,
-                                    content: message,
-                                    isAutomated: true,
-                                    read: true
-                                });
+                                await this.db.logMessage(orderData.clientId, { chatId, fromMe: true, body: message, content: message, isAutomated: true, read: true });
                             }
                         }
                     }
-                } catch (e) {
-                    console.error('[Controller] Erro ao notificar status:', e);
-                }
+                } catch (e) {}
             }
             return { success: true };
         });
 
-        // --- CLIENTES ---
         ipcMain.handle('create-client-if-not-exists', async (e, data) => {
             try { 
                 return { 
@@ -609,11 +573,9 @@ class AppController {
             } 
             catch (err) { return { success: false, error: err.message }; }
         });
-        
         ipcMain.handle('update-client', async (e, id, data) => await this.db.updateDocument('clients', id, data));
         ipcMain.handle('delete-client', async (e, id) => await this.db.deleteDocument('clients', id));
         
-        // --- PRODUTOS ---
         ipcMain.handle('get-products', async () => {
              const snap = await this.db.db.collection('products').orderBy('name').get();
              return { success: true, products: snap.docs.map(d => ({ id: d.id, ...d.data() })) };
@@ -629,9 +591,12 @@ class AppController {
         ipcMain.handle('update-ai-settings', (e, s) => { this.db.updateDocument('settings', 'storeConfig', s); this.ai.updateConfig(s); return { success: true }; });
         ipcMain.handle('print-order-manual', (e, order) => this._printOrder('manual', order));
         ipcMain.handle('get-printers', async () => ({ success: true, printers: await this.mainWindow.webContents.getPrintersAsync() }));
-        ipcMain.handle('create-manual-order', async (e, order) => await this.db.createStandardOrder(order));
+        ipcMain.handle('create-manual-order', async (e, order) => {
+            // Gera ID numérico simples baseado no tempo (últimos 4 dígitos)
+            const shortId = Date.now().toString().slice(-4);
+            return await this.db.createStandardOrder({ ...order, shortId });
+        });
         
-        // Relatório PDF
         ipcMain.handle('print-report', async (e, data) => {
             const workerWindow = new BrowserWindow({ show: false });
             const html = `<html><body><h1>Relatório Gerado</h1></body></html>`; 
@@ -639,14 +604,86 @@ class AppController {
             workerWindow.webContents.print({ silent: false }); 
             return { success: true };
         });
+
+        ipcMain.handle('print-close-register', async (e, summaryData) => {
+             return await this._printCloseRegister(summaryData);
+        });
     }
 
-    /**
-     * Lógica de Impressão de Cupom (Térmica) - BLINDADA CONTRA [object Object]
-     */
+    async _printCloseRegister(data) {
+        const conf = await this.db.getStoreConfig();
+        const printerName = conf.printerName || ''; 
+
+        if (this.workerWindow) { try { this.workerWindow.close(); } catch(e){} this.workerWindow = null; }
+        this.workerWindow = new BrowserWindow({ show: false, width: 400, height: 600, webPreferences: { nodeIntegration: true } });
+
+        const html = `
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <style>
+                    @page { margin: 0; size: auto; }
+                    body { font-family: 'Courier New', monospace; font-size: 12px; color: #000; margin: 0; padding: 0; width: 100%; background: #fff; }
+                    .ticket-wrapper { width: 92%; margin: 5px auto; padding-left: 5px; }
+                    .header { margin-bottom: 10px; border-bottom: 2px dashed #000; padding-bottom: 5px; text-align: center; }
+                    .title { font-size: 14px; font-weight: bold; }
+                    .row { display: flex; justify-content: space-between; margin-bottom: 3px; }
+                    .total-row { border-top: 1px solid #000; border-bottom: 1px solid #000; margin: 10px 0; padding: 5px 0; font-weight: bold; font-size: 14px; }
+                    .footer { text-align: center; margin-top: 10px; font-size: 10px; }
+                </style>
+            </head>
+            <body>
+                <div class="ticket-wrapper">
+                    <div class="header">
+                        <div class="title">FECHAMENTO DE CAIXA</div>
+                        <div>${conf.storeName || 'Doce Floco'}</div>
+                        <div style="font-size: 10px; margin-top:4px;">${data.date}</div>
+                    </div>
+
+                    <div class="row"><span>Qtd Pedidos:</span> <span>${data.count}</span></div>
+                    <div style="border-bottom: 1px dashed #000; margin: 5px 0;"></div>
+
+                    <div class="row"><span>Pix:</span> <span>R$ ${data.methods['Pix'].toFixed(2)}</span></div>
+                    <div class="row"><span>Dinheiro:</span> <span>R$ ${data.methods['Dinheiro'].toFixed(2)}</span></div>
+                    <div class="row"><span>Cartão:</span> <span>R$ ${data.methods['Cartão'].toFixed(2)}</span></div>
+                    ${data.methods['Outros'] > 0 ? `<div class="row"><span>Outros:</span> <span>R$ ${data.methods['Outros'].toFixed(2)}</span></div>` : ''}
+
+                    <div class="total-row row">
+                        <span>TOTAL GERAL:</span>
+                        <span>R$ ${data.total.toFixed(2)}</span>
+                    </div>
+
+                    <div class="footer">
+                        <br>__________________________<br>
+                        Assinatura Responsável
+                    </div>
+                </div>
+            </body>
+            </html>
+        `;
+
+        const tempPath = path.join(app.getPath('temp'), `close_reg_${Date.now()}.html`);
+        fs.writeFileSync(tempPath, html);
+        
+        this.workerWindow.loadURL(`file://${tempPath}`);
+        this.workerWindow.webContents.once('did-finish-load', () => {
+            const printOptions = { silent: true, margins: { marginType: 'none' } };
+            if (printerName) printOptions.deviceName = printerName;
+            this.workerWindow.webContents.print(printOptions, () => {
+                setTimeout(() => { 
+                    if (this.workerWindow) { this.workerWindow.close(); this.workerWindow = null; } 
+                    try { fs.unlinkSync(tempPath); } catch(e){} 
+                }, 5000);
+            });
+        });
+
+        return { success: true };
+    }
+
     async _printOrder(orderId, orderData) {
         const conf = await this.db.getStoreConfig();
-        if (!conf.printerName) return { success: false, error: "Sem impressora" };
+        const printerName = conf.printerName || ''; 
 
         if (this.workerWindow) { try { this.workerWindow.close(); } catch(e){} this.workerWindow = null; }
         this.workerWindow = new BrowserWindow({ show: false, width: 400, height: 600, webPreferences: { nodeIntegration: true } });
@@ -654,16 +691,11 @@ class AppController {
         const { DateTime } = require('luxon');
         const dateStr = DateTime.now().setLocale('pt-BR').toLocaleString(DateTime.DATETIME_SHORT);
         
-        // --- CORREÇÃO DE FORMATAÇÃO DOS ITENS ---
         let itemsHtml = "-";
-        
         if (orderData.items) {
-            // Caso 1: É um Array (Lista)
             if (Array.isArray(orderData.items)) {
-                // Verifica se o conteúdo do array são Objetos (o causador do erro)
                 const firstItem = orderData.items[0];
                 if (firstItem && typeof firstItem === 'object') {
-                    // Transforma [{name: 'X', qty: 1}] em "1x X"
                     itemsHtml = orderData.items.map(i => {
                         const qtd = i.qty || i.quantity || i.q || 1;
                         const nome = i.name || i.item || i.n || 'Item sem nome';
@@ -671,30 +703,21 @@ class AppController {
                         return `${qtd}x ${nome}${obs}`;
                     }).join('<br>');
                 } else {
-                    // É um array de textos simples ["1x Uva", "2x Coco"]
                     itemsHtml = orderData.items.join('<br>');
                 }
             } 
-            // Caso 2: Já é Texto (String)
             else if (typeof orderData.items === 'string') {
                 itemsHtml = orderData.items.replace(/\n/g, '<br>');
             } 
-            // Caso de Segurança
             else {
                 itemsHtml = String(orderData.items);
             }
         }
-        // ----------------------------------------
 
         const totalFormatted = parseFloat(orderData.total || 0).toFixed(2);
-        
-        // ID CURTO (Ex: #4829)
         const displayId = orderData.shortId || (typeof orderId === 'string' ? orderId.slice(0, 4).toUpperCase() : 'MANUAL');
-        
         const addressDisplay = orderData.address && orderData.address !== 'undefined' ? orderData.address : 'Retirada/Balcão';
         const notesHtml = orderData.notes ? `<div style="margin-top:5px; font-weight:bold; border:1px solid #000; padding:2px; font-size:10px;">OBS: ${orderData.notes}</div>` : '';
-
-        // Se houver Itens Emprestados (Encomendas)
         let loanHtml = '';
         if (orderData.loanedItems) {
             loanHtml = `<div class="divider"></div><div class="info-row"><span class="info-label">DEVOLUÇÃO:</span> <span class="info-val">${orderData.returnDate || 'A combinar'}</span></div><div class="items-box">EMPRÉSTIMO:<br>${orderData.loanedItems}</div>`;
@@ -753,7 +776,9 @@ class AppController {
         
         this.workerWindow.loadURL(`file://${tempPath}`);
         this.workerWindow.webContents.once('did-finish-load', () => {
-            this.workerWindow.webContents.print({ silent: true, deviceName: conf.printerName, margins: { marginType: 'none' } }, () => {
+            const printOptions = { silent: true, margins: { marginType: 'none' } };
+            if (printerName) printOptions.deviceName = printerName;
+            this.workerWindow.webContents.print(printOptions, () => {
                 setTimeout(() => { 
                     if (this.workerWindow) { this.workerWindow.close(); this.workerWindow = null; } 
                     try { fs.unlinkSync(tempPath); } catch(e){} 
@@ -932,6 +957,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   createScheduledOrder: (data) => ipcRenderer.invoke('create-scheduled-order', data),
   updateScheduledOrder: (data) => ipcRenderer.invoke('update-scheduled-order', data),
   deleteScheduledOrder: (id) => ipcRenderer.invoke('delete-scheduled-order', id),
+  printCloseRegister: (data) => ipcRenderer.invoke('print-close-register', data),
 });
 
 ================================================================================
@@ -954,7 +980,7 @@ class AIService {
         try {
             this.genAI = new GoogleGenerativeAI(apiKey);
             this.model = this.genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-            console.log('[AI] Serviço Gemini inicializado (V6.2 - Pagamento Obrigatório).');
+            console.log('[AI] Serviço Gemini inicializado (V6.3 - Anti-Duplicidade).');
         } catch (e) {
             console.error('[AI] Falha ao iniciar Gemini:', e.message);
         }
@@ -1006,32 +1032,60 @@ class AIService {
     }
 
     /**
-     * PROMPT ENGENHARIA: PICOLÉS & AÇAÍ (COM VALIDAÇÃO DE DISPONIBILIDADE)
+     * PROMPT ENGENHARIA: COM CONTEXTO DE PEDIDO ATIVO
      */
-    _buildSystemPrompt({ clientName, history, chatRecent, menuJson, todayDate, dayName, forcedContext, lastAddress }) {
+    _buildSystemPrompt({ clientName, history, chatRecent, menuJson, todayDate, dayName, forcedContext, lastAddress, activeOrder }) {
         const { 
             storeName, deliveryFee, address,
-            acaiSizes,      
-            freeAddons,     
-            paidAddons,     
+            acaiSizes, freeAddons, paidAddons,     
         } = this.config;
 
-        const contextWarning = forcedContext 
-            ? `ATENÇÃO: O cliente está respondendo sobre: ${forcedContext}.` 
-            : "";
-
-        const knownAddressInfo = lastAddress 
-            ? `Endereço Conhecido: "${lastAddress}".` 
-            : "Endereço: Não informado.";
-
+        const knownAddressInfo = lastAddress ? `Endereço Conhecido: "${lastAddress}".` : "Endereço: Não informado.";
         const hasAcaiMenu = acaiSizes && acaiSizes.trim().length > 0;
         
-        let acaiSection = hasAcaiMenu ? `
+        // --- ALTERAÇÃO AQUI: Lógica de Açaí ---
+        let acaiSection = "";
+        let acaiSilentRule = "";
+
+        if (hasAcaiMenu) {
+            acaiSection = `
             === 🟣 AÇAÍ ===
             1. TAMANHOS: [${acaiSizes}].
             2. GRÁTIS: [${freeAddons || 'Nenhum'}].
             3. 💰 EXTRAS (Pagos): [${paidAddons || 'Nenhum'}].
-        ` : `=== 🚫 AÇAÍ OFF === (Não estamos servindo açaí hoje).`;
+            `;
+        } else {
+            // Se não tem açaí, NÃO CRIAMOS UM CABEÇALHO VISÍVEL.
+            // Apenas uma regra interna.
+            acaiSilentRule = `
+            REGRA DE AÇAÍ:
+            - Atualmente NÃO estamos servindo Açaí (não cadastrado).
+            - IMPORTANTE: NÃO mencione que "não tem açaí" a menos que o cliente pergunte explicitamente sobre açaí.
+            - Se o cliente pedir o cardápio ou disser "Oi", ofereça apenas os picolés/sorvetes da vitrine.
+            `;
+        }
+        // --------------------------------------
+
+        // Lógica Anti-Duplicidade
+        let activeOrderSection = "";
+        if (activeOrder) {
+            activeOrderSection = `
+            === 🚨 PEDIDO EM ABERTO DETECTADO ===
+            O cliente JÁ POSSUI um pedido PENDENTE (ID: ${activeOrder.shortId}).
+            Itens Atuais: ${activeOrder.items}
+            Total Atual: R$ ${activeOrder.total}
+            
+            REGRAS CRÍTICAS:
+            1. Se o cliente quiser adicionar, remover ou mudar algo, use JSON "update_order" com "orderId": "${activeOrder.shortId}".
+            2. NUNCA use "create_order" se o cliente estiver apenas continuando a conversa sobre o mesmo pedido.
+            3. Só use "create_order" se o cliente disser explicitamente "Quero fazer OUTRO pedido novo" ou "Cancele esse e faça outro".
+            `;
+        } else {
+            activeOrderSection = `
+            === STATUS ===
+            Nenhum pedido pendente no momento. Se o cliente pedir algo e confirmar pagamento, use "create_order".
+            `;
+        }
 
         return `
         PERSONA: Atendente da ${storeName}. Data: ${todayDate}. Cliente: ${clientName}.
@@ -1044,20 +1098,28 @@ class AIService {
         ${menuJson}
         *Se estoque (s) = 0, diga que acabou.*
 
+        ${activeOrderSection}
+
         === 🚨 REGRAS DE PAGAMENTO (IMPORTANTE) ===
         1. Aceitamos APENAS: **Pix**, **Dinheiro** ou **Cartão**.
         2. "A Combinar" NÃO EXISTE.
         3. **OBRIGATÓRIO:** Antes de confirmar o pedido, você DEVE perguntar: "Qual a forma de pagamento? (Pix, Dinheiro ou Cartão)".
         4. NÃO gere o JSON "create_order" se o cliente não tiver definido o pagamento.
 
-        === REGRAS DE ENTREGA ===
+        === REGRAS GERAIS ===
         - Retirada: Grátis.
         - Entrega: Taxa R$ ${parseFloat(deliveryFee || 0).toFixed(2)}. Endereço obrigatório.
+        ${acaiSilentRule}
 
         === COMANDOS JSON ===
-        Só gere quando tiver: Itens, Endereço (se entrega) e PAGAMENTO DEFINIDO.
+        
+        A) CRIAR NOVO PEDIDO (Só se não houver pendente):
         ###JSON### {"type": "create_order", "items": "...", "total": 0.00, "method": "Entrega", "payment": "Pix", "address": "..."} ###ENDJSON###
         
+        B) ATUALIZAR PEDIDO EXISTENTE (Se houver pendente):
+        ###JSON### {"type": "update_order", "orderId": "ID_DO_PEDIDO", "newItems": "...", "newTotal": 0.00, "newAddress": "..."} ###ENDJSON###
+        *Mande apenas os campos que mudaram em update_order.*
+
         Histórico: ${history}
         Chat Atual:
         ${chatRecent}
@@ -1076,16 +1138,11 @@ class AIService {
                 command = JSON.parse(jsonMatch[1].trim());
                 cleanText = cleanText.replace(jsonMatch[0], "").trim();
                 
-                // Validação de Segurança do Pagamento
                 if (command.type === 'create_order') {
                     const validPayments = ['Pix', 'Dinheiro', 'Cartão'];
-                    // Normaliza para Title Case (ex: pix -> Pix)
                     let pay = command.payment || '';
                     pay = pay.charAt(0).toUpperCase() + pay.slice(1).toLowerCase();
-                    
                     if (!validPayments.includes(pay)) {
-                        // Se a IA alucinar um pagamento inválido, forçamos null para não criar o pedido ainda
-                        // e deixamos apenas o texto perguntando.
                         command = null; 
                     } else {
                         command.payment = pay;
@@ -1142,36 +1199,21 @@ class DatabaseService {
      * Retorna itens para o menu da IA e Frontend
      * @returns {Object} { menuText: string, menuStructured: Array }
      */
-     async getActiveProducts() {
+    async getActiveProducts() {
         try {
             const snapshot = await this.db.collection('products').where('active', '==', true).get();
-            const menuStructured = []; // Isso a IA usa para saber a quantidade real (JSON)
-            const menuLines = [];      // Isso é o texto que a IA "lê" sobre o produto
-
+            const menuStructured = []; 
+            const menuLines = [];      
             snapshot.forEach(doc => {
                 const p = doc.data();
                 const stock = parseInt(p.quantity || 0);
                 const price = typeof p.price === 'number' ? p.price.toFixed(2) : p.price;
                 const hasImage = !!p.imagePath;
-
-                // --- ALTERAÇÃO: Só marcamos se estiver ESGOTADO ---
                 let stockInfo = "";
-                if (stock <= 0) {
-                    stockInfo = "[ESGOTADO]";
-                }
-                // REMOVEMOS O [RESTAM X]. Se tiver estoque, não escrevemos nada.
-                
+                if (stock <= 0) stockInfo = "[ESGOTADO]";
                 menuLines.push(`- ${p.name} (R$ ${price}) ${stockInfo}`);
-
-                menuStructured.push({
-                    id: doc.id,
-                    n: p.name,
-                    p: price,
-                    s: stock, // O número continua aqui para a IA calcular se pode vender
-                    img: hasImage
-                });
+                menuStructured.push({ id: doc.id, n: p.name, p: price, s: stock, img: hasImage });
             });
-
             return { menuStructured, menuText: menuLines };
         } catch (error) {
             console.error('[DB] Erro ao buscar produtos:', error);
@@ -1179,24 +1221,22 @@ class DatabaseService {
         }
     }
 
-    /**
-     * Verifica duplicidade de pedido agendado (Janela de 2 minutos)
-     */
+    async getLastPendingOrder(clientId) {
+        try {
+            const snapshot = await this.db.collection('orders').where('clientId', '==', clientId).where('status', '==', 'Pendente').orderBy('createdAt', 'desc').limit(1).get();
+            if (snapshot.empty) return null;
+            const doc = snapshot.docs[0];
+            return { id: doc.id, ...doc.data() };
+        } catch (error) { return null; }
+    }
+
     async isDuplicateOrder(clientId, items, total, date) {
         const twoMinsAgo = admin.firestore.Timestamp.fromMillis(Date.now() - 120000);
-        const snapshot = await this.db.collection('orders')
-            .where('clientId', '==', clientId)
-            .where('status', '==', 'Agendado')
-            .where('createdAt', '>', twoMinsAgo)
-            .get();
-
+        const snapshot = await this.db.collection('orders').where('clientId', '==', clientId).where('status', '==', 'Agendado').where('createdAt', '>', twoMinsAgo).get();
         let isDuplicate = false;
         snapshot.forEach(doc => {
             const d = doc.data();
-            // Comparação estrita dos dados vitais
-            if (d.items === items && parseFloat(d.total) === parseFloat(total) && d.dueDate === date) {
-                isDuplicate = true;
-            }
+            if (d.items === items && parseFloat(d.total) === parseFloat(total) && d.dueDate === date) isDuplicate = true;
         });
         return isDuplicate;
     }
@@ -1206,7 +1246,6 @@ class DatabaseService {
      * ATUALIZADO: Suporte a Empréstimo de Materiais (Caixas, Carrinhos)
      */
     async createScheduledOrder({ clientId, clientName, items, total, date, method, address, loanedItems, returnDate }) {
-        // 1. Check Anti-Duplicidade
         const isDup = await this.isDuplicateOrder(clientId, items, total, date);
         if (isDup) {
             console.log(`[Anti-Dup] Pedido ignorado para ${clientName}`);
@@ -1233,7 +1272,6 @@ class DatabaseService {
             createdAt: admin.firestore.FieldValue.serverTimestamp(),
             notes: loanedItems ? `⚠️ EMPRÉSTIMO: Devolução em ${returnDate}` : "Encomenda"
         };
-
         await this.db.collection('orders').add(orderData);
         return { success: true, type: 'scheduled' };
     }
@@ -1242,33 +1280,53 @@ class DatabaseService {
      * Cria Pedido com TRANSAÇÃO (Atualizado com ShortID)
      */
     async createStandardOrder({ clientId, clientName, items, total, method, payment, address, cart, shortId }) {
-        // ... (Lógica de Duplicidade mantida igual) ...
-
         const orderRef = this.db.collection('orders').doc();
+        // --- CORREÇÃO: Garante que o ID exista para o log e gravação ---
+        const finalShortId = shortId || "0000";
 
         try {
             await this.db.runTransaction(async (t) => {
-                // ... (Lógica de Estoque/Cart mantida igual) ...
+                const pendingUpdates = []; 
 
-                // Cria o pedido com o SHORT ID
+                if (cart && Array.isArray(cart) && cart.length > 0) {
+                    for (const item of cart) {
+                        if (!item.id) continue;
+                        const productRef = this.db.collection('products').doc(item.id);
+                        const productDoc = await t.get(productRef); 
+
+                        if (!productDoc.exists) {
+                            console.warn(`Produto ID ${item.id} não encontrado para baixa.`);
+                            continue;
+                        }
+
+                        const pData = productDoc.data();
+                        const currentQty = parseInt(pData.quantity || 0);
+                        const soldQty = parseInt(item.qty || item.quantity || 1);
+
+                        if (currentQty < soldQty) {
+                            throw new Error(`Estoque insuficiente para: ${pData.name} (Restam: ${currentQty})`);
+                        }
+
+                        pendingUpdates.push({ ref: productRef, newQty: currentQty - soldQty });
+                    }
+                }
+
+                for (const update of pendingUpdates) {
+                    t.update(update.ref, { quantity: update.newQty });
+                }
+
                 t.set(orderRef, {
-                    shortId: shortId || "0000", // NOVO CAMPO
-                    clientId,
-                    clientName,
-                    items: items || "Venda via IA",
-                    total: total || 0,
-                    deliveryMethod: method || "A Combinar",
-                    address: address || "Retirada",
-                    paymentMethod: payment || "A Combinar",
-                    status: "Pendente",
+                    shortId: finalShortId, // Usa a constante segura
+                    clientId, clientName, items: items || "Venda", total: total || 0,
+                    deliveryMethod: method || "A Combinar", address: address || "Retirada",
+                    paymentMethod: payment || "A Combinar", status: "Pendente",
                     createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                    notes: "Pedido Automático",
-                    cart: cart || []
+                    notes: "Pedido Automático", cart: cart || []
                 });
             });
 
-            console.log(`[DB] Pedido #${shortId} criado.`);
-            return { success: true, orderId: orderRef.id, shortId };
+            console.log(`[DB] Pedido #${finalShortId} criado e estoque atualizado.`);
+            return { success: true, orderId: orderRef.id, shortId: finalShortId };
 
         } catch (e) {
             console.error("[DB] Falha na transação:", e.message);
@@ -1298,10 +1356,7 @@ class DatabaseService {
      * Busca ou cria cliente baseado no telefone (ATUALIZADO)
      */
     async getOrCreateClient(rawPhone, name, countryCode = '55', address = null) {
-        // Normalização básica para busca
         let inputClean = rawPhone.replace('@c.us', '').replace(/\D/g, '');
-        
-        // Lógica de Permutações (Para encontrar o cliente mesmo com/sem 9º dígito)
         const candidates = new Set([inputClean, `+${inputClean}`]);
         if (inputClean.startsWith('55') && inputClean.length >= 12) {
             const ddd = inputClean.substring(2, 4);
@@ -1314,15 +1369,10 @@ class DatabaseService {
                 candidates.add(`55${ddd}9${numberPart}`);
             }
         }
-
         const snapshot = await this.db.collection('clients').where('phone', 'in', Array.from(candidates)).limit(1).get();
-        
         if (!snapshot.empty) {
             const doc = snapshot.docs[0];
             const data = doc.data();
-            
-            // Se veio um nome válido na criação manual, atualiza
-            // Se veio um endereço na criação manual e o cliente não tinha, atualiza
             let updates = {};
             if (name && name !== "Cliente" && data.name.startsWith("Cliente ") && name !== data.name) {
                 updates.name = name;
@@ -1337,11 +1387,8 @@ class DatabaseService {
                 await doc.ref.update(updates);
                 return { id: doc.id, ...data, ...updates };
             }
-
             return { id: doc.id, ...data };
         }
-
-        // Cria novo
         const newClient = {
             name: name || `Cliente ${inputClean.slice(-4)}`,
             phone: `+${inputClean}`,
@@ -1370,7 +1417,6 @@ class DatabaseService {
             .get();
 
         if (snapshot.empty) return "Histórico: Nenhum pedido anterior.";
-        
         return snapshot.docs.map(doc => {
             const d = doc.data();
             const date = d.createdAt ? DateTime.fromJSDate(d.createdAt.toDate()).toLocaleString(DateTime.DATE_SHORT) : '?';
@@ -1397,7 +1443,6 @@ class DatabaseService {
         return history.reverse().join("\n");
     }
     
-    // Método auxiliar para buscar caminho da imagem
     async getProductImagePath(productId) {
         const doc = await this.db.collection('products').doc(productId).get();
         if(doc.exists && doc.data().imagePath) return { path: doc.data().imagePath, name: doc.data().name };
@@ -1434,7 +1479,6 @@ class DatabaseService {
                 .get();
 
             if (snapshot.empty) return { success: true, appointments: [] };
-
             const appointments = snapshot.docs.map(doc => {
                 const data = doc.data();
                 return {
@@ -1448,9 +1492,7 @@ class DatabaseService {
                     service: data.items
                 };
             });
-            // Ordenação JS caso falte índice composto no Firestore
             appointments.sort((a, b) => b.rawDate - a.rawDate);
-
             return { success: true, appointments };
         } catch (error) {
             console.error("[DB] Erro getClientAppointments:", error);
@@ -1458,7 +1500,6 @@ class DatabaseService {
         }
     }
 
-    // Genérico para deletar (Clientes, Pedidos, Produtos)
     async deleteDocument(collection, id) {
         try {
             await this.db.collection(collection).doc(id).delete();
@@ -1468,7 +1509,6 @@ class DatabaseService {
         }
     }
 
-    // Genérico para atualizar
     async updateDocument(collection, id, data) {
         try {
             await this.db.collection(collection).doc(id).update(data);
@@ -3009,11 +3049,13 @@ import { $, $$, show, hide } from '../utils/DOM.js';
 import { UI } from '../utils/UI.js';
 import { ProductService } from '../services/ProductService.js';
 import { ClientService } from '../services/ClientService.js';
+import { FirebaseService } from '../services/FirebaseService.js';
 
 export class PosModule {
     constructor() {
         this.productService = new ProductService();
         this.clientService = new ClientService();
+        this.db = FirebaseService.getInstance().db;
         
         this.products = [];
         this.cart = [];
@@ -3027,6 +3069,7 @@ export class PosModule {
         this.totalEl = $('posTotal');
         this.subtotalEl = $('posSubtotal');
         this.btnFinalize = $('btnPosFinalize');
+        this.btnCloseRegister = $('btnCloseRegister');
     }
 
     async init() {
@@ -3040,7 +3083,6 @@ export class PosModule {
     }
 
     destroy() {
-        // Remove listeners de teclado globais se necessário
         document.onkeydown = null;
     }
 
@@ -3053,7 +3095,6 @@ export class PosModule {
     }
 
     async loadClients() {
-        // Carrega lista simples para o select
         this.clientService.listenToClients((clients) => {
             this.clientSelect.innerHTML = '<option value="">Consumidor Final</option>';
             clients.forEach(c => {
@@ -3066,14 +3107,12 @@ export class PosModule {
     }
 
     setupEvents() {
-        // Busca em tempo real
         this.searchInput.oninput = (e) => {
             const term = e.target.value.toLowerCase();
             const filtered = this.products.filter(p => p.name.toLowerCase().includes(term));
             this.renderProducts(filtered);
         };
 
-        // Seleção de Método de Pagamento
         $$('.pos-pay-btn').forEach(btn => {
             btn.onclick = () => {
                 $$('.pos-pay-btn').forEach(b => b.classList.remove('bg-purple-600', 'border-purple-500'));
@@ -3082,22 +3121,127 @@ export class PosModule {
             };
         });
 
-        // Limpar Carrinho
         $('btnPosClear').onclick = () => {
             this.cart = [];
             this.renderCart();
         };
 
-        // Finalizar Venda
         this.btnFinalize.onclick = () => this.handleCheckout();
 
-        // Atalhos de Teclado
+        if (this.btnCloseRegister) {
+            this.btnCloseRegister.onclick = () => this.handleCloseRegister();
+        }
+
         document.onkeydown = (e) => {
             if (e.key === 'F10') {
                 e.preventDefault();
                 this.btnFinalize.click();
             }
         };
+    }
+
+    // --- NOVA LÓGICA: PRÉ-VISUALIZAÇÃO NA TELA ---
+    async handleCloseRegister() {
+        UI.toast('Calculando fechamento...');
+
+        try {
+            const { DateTime } = luxon;
+            const now = DateTime.now();
+            const startOfDay = now.startOf('day').toJSDate();
+            const endOfDay = now.endOf('day').toJSDate();
+
+            // Busca pedidos válidos do dia
+            const snapshot = await this.db.collection('orders')
+                .where('createdAt', '>=', startOfDay)
+                .where('createdAt', '<=', endOfDay)
+                .get();
+
+            const summary = {
+                date: now.toFormat('dd/MM/yyyy HH:mm'),
+                total: 0,
+                count: 0,
+                methods: { 'Pix': 0, 'Dinheiro': 0, 'Cartão': 0, 'Outros': 0 }
+            };
+
+            snapshot.forEach(doc => {
+                const data = doc.data();
+                if (data.status === 'Cancelado') return; // Ignora cancelados
+
+                const val = parseFloat(data.total || 0);
+                summary.total += val;
+                summary.count++;
+
+                let method = data.paymentMethod || 'Outros';
+                // Normaliza (ex: pix -> Pix)
+                method = method.charAt(0).toUpperCase() + method.slice(1).toLowerCase();
+                
+                if (summary.methods[method] !== undefined) {
+                    summary.methods[method] += val;
+                } else {
+                    summary.methods['Outros'] += val;
+                }
+            });
+
+            // GERA HTML DO CUPOM PARA VISUALIZAÇÃO
+            const cupomHtml = `
+                <div class="bg-yellow-50 border border-yellow-200 p-4 font-mono text-sm text-gray-800 shadow-inner rounded mb-4">
+                    <div class="text-center border-b border-dashed border-gray-400 pb-2 mb-2">
+                        <h3 class="font-bold text-lg">FECHAMENTO DE CAIXA</h3>
+                        <p class="text-xs">${summary.date}</p>
+                    </div>
+                    
+                    <div class="flex justify-between mb-1"><span>Qtd Pedidos:</span> <span>${summary.count}</span></div>
+                    <div class="border-b border-dashed border-gray-300 my-2"></div>
+
+                    <div class="flex justify-between"><span>Pix:</span> <span>R$ ${summary.methods.Pix.toFixed(2)}</span></div>
+                    <div class="flex justify-between"><span>Dinheiro:</span> <span>R$ ${summary.methods.Dinheiro.toFixed(2)}</span></div>
+                    <div class="flex justify-between"><span>Cartão:</span> <span>R$ ${summary.methods.Cartão.toFixed(2)}</span></div>
+                    ${summary.methods.Outros > 0 ? `<div class="flex justify-between text-gray-500"><span>Outros:</span> <span>R$ ${summary.methods.Outros.toFixed(2)}</span></div>` : ''}
+
+                    <div class="border-t border-dashed border-gray-800 mt-3 pt-2">
+                        <div class="flex justify-between font-bold text-lg">
+                            <span>TOTAL:</span>
+                            <span>R$ ${summary.total.toFixed(2)}</span>
+                        </div>
+                    </div>
+                </div>
+                <p class="text-center text-xs text-gray-500 mb-4">Confira os valores antes de imprimir.</p>
+            `;
+
+            // ABRE MODAL DE DECISÃO
+            UI._createModal(`
+                <h3 class="text-lg font-bold text-gray-800 mb-2">Conferência de Caixa</h3>
+                ${cupomHtml}
+                <div class="flex flex-col gap-2">
+                    <button id="btnPrintConfirm" class="w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-3 rounded-lg shadow-lg flex justify-center items-center gap-2">
+                        <i class="fas fa-print"></i> CONFIRMAR E IMPRIMIR
+                    </button>
+                    <button id="btnCancelClose" class="w-full bg-white border border-gray-300 text-gray-700 font-bold py-2 rounded-lg hover:bg-gray-50">
+                        Apenas Fechar (Não Imprimir)
+                    </button>
+                </div>
+            `, async (card, close) => {
+                
+                // Botão IMPRIMIR
+                card.querySelector('#btnPrintConfirm').onclick = async () => {
+                    close();
+                    UI.toast('Enviando para impressora...');
+                    const res = await window.electronAPI.printCloseRegister(summary);
+                    if (!res.success) {
+                        UI.alert('Erro Impressão', res.error || 'Verifique se a impressora está ligada e selecionada nas Configurações.');
+                    } else {
+                        UI.toast('Relatório impresso com sucesso!', 'success');
+                    }
+                };
+
+                // Botão FECHAR
+                card.querySelector('#btnCancelClose').onclick = () => close();
+            });
+
+        } catch (e) {
+            console.error(e);
+            UI.alert('Erro', 'Falha ao processar fechamento: ' + e.message);
+        }
     }
 
     renderProducts(list) {
@@ -3177,7 +3321,6 @@ export class PosModule {
         this.totalEl.innerText = `R$ ${total.toFixed(2)}`;
         this.subtotalEl.innerText = `R$ ${total.toFixed(2)}`;
         
-        // Auto-scroll
         this.cartList.scrollTop = this.cartList.scrollHeight;
     }
 
@@ -3218,7 +3361,7 @@ export class PosModule {
             deliveryMethod: 'Balcão',
             status: 'Concluído',
             notes: 'Venda Rápida POS',
-            cart: this.cart.map(i => ({ id: i.id, qty: i.quantity })) // Formato para o DatabaseService
+            cart: this.cart.map(i => ({ id: i.id, qty: i.quantity })) 
         };
 
         this.btnFinalize.disabled = true;
@@ -3229,7 +3372,6 @@ export class PosModule {
             if (res.success) {
                 UI.toast('Venda finalizada com sucesso!', 'success');
                 
-                // Pergunta se quer imprimir
                 const print = await UI.confirm('Sucesso!', 'Deseja imprimir o cupom?', 'Imprimir', 'blue');
                 if (print) {
                     await window.electronAPI.printOrder({ ...orderData, id: res.orderId });
@@ -3237,7 +3379,7 @@ export class PosModule {
 
                 this.cart = [];
                 this.renderCart();
-                await this.loadProducts(); // Recarrega estoque visualmente
+                await this.loadProducts(); 
             } else {
                 UI.alert('Erro na Venda', res.error);
             }
@@ -4630,10 +4772,18 @@ ARQUIVO: /src/renderer/index.html
 
                     <!-- Direita: Carrinho -->
                     <div class="w-96 flex flex-col bg-slate-900 rounded-2xl shadow-2xl overflow-hidden text-white border-l-4 border-purple-500">
-                        <div class="p-4 bg-slate-800 border-b border-slate-700">
-                            <label class="text-[10px] font-bold text-slate-400 uppercase">Cliente</label>
-                            <select id="posClientSelect" class="w-full bg-slate-900 border border-slate-600 rounded-lg p-2 text-sm mt-1 focus:border-purple-500 outline-none"></select>
+                        <!-- Header do Carrinho com Botão de Fechar Caixa -->
+                        <div class="p-4 bg-slate-800 border-b border-slate-700 flex justify-between items-center">
+                            <div>
+                                <label class="text-[10px] font-bold text-slate-400 uppercase">Cliente</label>
+                                <select id="posClientSelect" class="w-40 bg-slate-900 border border-slate-600 rounded-lg p-1 text-sm mt-1 focus:border-purple-500 outline-none"></select>
+                            </div>
+                            <!-- NOVO BOTÃO DE FECHAR CAIXA -->
+                            <button id="btnCloseRegister" class="bg-emerald-600 hover:bg-emerald-700 text-white text-[10px] font-bold py-2 px-3 rounded-lg shadow transition flex flex-col items-center gap-1" title="Imprimir Relatório do Dia">
+                                <i class="fas fa-cash-register text-sm"></i> FECHAR CAIXA
+                            </button>
                         </div>
+
                         <div id="posCartList" class="flex-1 overflow-y-auto p-4 space-y-2 custom-scrollbar">
                             <div id="posEmptyCart" class="h-full flex flex-col items-center justify-center text-slate-600 space-y-2 opacity-60">
                                 <i class="fas fa-shopping-basket text-4xl"></i>
