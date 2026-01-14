@@ -1,0 +1,29 @@
+# Node modules
+node_modules/
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+
+# Electron
+dist/
+release/
+
+# Environment variables
+.env
+config/serviceAccountKey.json
+
+# MacOS specific files
+.DS_Store
+
+# Logs
+logs/
+*.log
+
+# WhatsApp Session (NUNCA SUBIR ISSO)
+.wwebjs_auth/
+.wwebjs_cache/
+session-laser-clinic-session/
+
+.cache
+chrome-bin
+whatsapp_session/

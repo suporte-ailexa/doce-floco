@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Doce Floco Manager V6.2</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- FontAwesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Firebase SDKs (Compat) -->
+    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-firestore-compat.js"></script>
+    
+    <!-- Utils -->
+    <script src="https://cdn.jsdelivr.net/npm/luxon@3.4.4/build/global/luxon.min.js"></script>
+    <script src="https://unpkg.com/qrious@4.0.2/dist/qrious.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    
+    <!-- Tailwind Custom Config -->
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        purple: { 400: '#a78bfa', 500: '#8b5cf6', 600: '#7c3aed', 700: '#6d28d9' },
+                        cyan: { 50: '#ecfeff', 100: '#cffafe', 400: '#22d3ee', 500: '#06b6d4', 600: '#0891b2' } 
+                    },
+                    animation: {
+                        'fade-in': 'fadeIn 0.3s ease-out',
+                        'slide-in': 'slideIn 0.3s ease-out'
+                    },
+                    keyframes: {
+                        fadeIn: { '0%': { opacity: '0' }, '100%': { opacity: '1' } },
+                        slideIn: { '0%': { transform: 'translateX(100%)' }, '100%': { transform: 'translateX(0)' } }
+                    }
+                }
+            }
+        }
+    </script>
+    
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; overflow: hidden; }
+        .hidden { display: none !important; }
+        
+        /* Modal Overlay */
+        .modal { 
+            position: fixed; inset: 0; background: rgba(0,0,0,0.5); 
+            display: flex; justify-content: center; align-items: center; 
+            z-index: 50; backdrop-filter: blur(2px);
+        }
+        .modal-content { 
+            background: white; padding: 1.5rem; border-radius: 0.75rem; 
+            width: 90%; max-width: 500px; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1); 
+            animation: modalPop 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        }
+        @keyframes modalPop { from { transform: scale(0.9); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+
+        /* Stepper Logic */
+        .step-circle.active { border-color: #7c3aed; background: #7c3aed; color: white; }
+        
+        /* Toggle Switch */
+        .toggle-checkbox:checked { right: 0; border-color: #10b981; }
+        .toggle-checkbox:checked + .toggle-label { background-color: #10b981; }
+        .toggle-label { width: 40px; height: 20px; position: relative; display: block; background: #e5e7eb; border-radius: 20px; cursor: pointer; transition: 0.3s; }
+        
+        /* Scrollbars */
+        .custom-scrollbar { overflow-y: auto; }
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; height: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: rgba(0,0,0,0.05); border-radius: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        
+        /* Kanban */
+        .kanban-card { transition: all 0.2s; }
+        .kanban-card:hover { transform: translateY(-2px); box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); border-color: #a78bfa; }
+    </style>
+</head>
+<body class="bg-purple-50 text-gray-800 h-screen w-screen flex flex-col">
+
+    <!-- =================================================================================
+         1. TELA DE LOGIN
+    ================================================================================== -->
+    <div id="authSection" class="flex-1 flex flex-col justify-center items-center bg-slate-900 relative overflow-hidden">
+        <!-- Background Decorativo -->
+        <div class="absolute top-0 left-0 w-full h-full opacity-10 pointer-events-none">
+            <i class="fas fa-snowflake text-9xl text-white absolute top-10 left-10 animate-pulse"></i>
+            <i class="fas fa-ice-cream text-9xl text-white absolute bottom-10 right-10"></i>
+        </div>
+
+        <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-md border-t-4 border-purple-500 z-10">
+            <div class="text-center mb-6">
+                <div class="bg-purple-100 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-3">
+                    <i class="fas fa-ice-cream text-3xl text-purple-600"></i>
+                </div>
+                <h1 class="text-2xl font-bold text-gray-800 tracking-tight">Doce Floco Manager</h1>
+                <p class="text-gray-400 text-xs uppercase tracking-widest mt-1">Acesso Administrativo</p>
+            </div>
+            
+            <form id="loginForm" class="space-y-4">
+                <div>
+                    <label class="block text-xs font-bold text-gray-500 mb-1">EMAIL</label>
+                    <div class="relative">
+                        <i class="fas fa-envelope absolute left-3 top-3 text-gray-400"></i>
+                        <input type="email" id="email" required class="w-full pl-10 pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-purple-500 outline-none transition" placeholder="admin@docefloco.com">
+                    </div>
+                </div>
+                <div>
+                    <label class="block text-xs font-bold text-gray-500 mb-1">SENHA</label>
+                    <div class="relative">
+                        <i class="fas fa-lock absolute left-3 top-3 text-gray-400"></i>
+                        <input type="password" id="password" required class="w-full pl-10 pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-purple-500 outline-none transition" placeholder="••••••••">
+                    </div>
+                </div>
+                <button type="submit" class="w-full bg-purple-600 text-white py-3 rounded-lg hover:bg-purple-700 font-bold transition shadow-lg transform active:scale-95">
+                    Entrar no Sistema
+                </button>
+                <p id="authMessage" class="text-red-500 text-center text-xs hidden font-bold mt-2"></p>
+            </form>
+        </div>
+        <p class="text-slate-600 text-xs mt-8">V6.2 - Doce Floco (Açaí & Picolés)</p>
+    </div>
+
+    <!-- =================================================================================
+         2. APLICAÇÃO PRINCIPAL
+    ================================================================================== -->
+    <div id="appSection" class="flex h-screen w-full hidden overflow-hidden">
+        
+        <!-- SIDEBAR (Barra Lateral) -->
+        <aside id="sidebar" class="w-64 bg-slate-900 text-white flex flex-col justify-between p-4 shadow-xl z-20 flex-shrink-0 transition-all duration-300">
+            <div>
+                <!-- Logo -->
+                <div class="flex items-center gap-3 mb-10 px-2 mt-2">
+                    <div class="w-10 h-10 bg-gradient-to-br from-purple-500 to-cyan-400 rounded-lg flex items-center justify-center shadow-lg">
+                        <i class="fas fa-snowflake text-white"></i>
+                    </div>
+                    <div>
+                        <h1 class="font-bold text-lg leading-tight">Doce Floco</h1>
+                        <p class="text-[10px] text-cyan-400 font-bold tracking-widest uppercase">Manager</p>
+                    </div>
+                </div>
+                
+                <!-- Menu -->
+                <nav class="space-y-1">
+                    <a href="#" id="navDashboard" class="flex items-center p-3 rounded-xl hover:bg-slate-800 transition group nav-item mb-1" data-section="dashboard">
+                        <i class="fas fa-chart-pie w-6 text-center text-slate-400 group-hover:text-cyan-400 transition"></i>
+                        <span class="ml-3 font-medium text-sm text-slate-300 group-hover:text-white">Visão Geral</span>
+                    </a>
+                    
+                    <a href="#" id="navPos" class="flex items-center p-3 rounded-xl hover:bg-slate-800 transition group nav-item mb-1" data-section="pos">
+                        <i class="fas fa-cash-register w-6 text-center text-slate-400 group-hover:text-cyan-400 transition"></i>
+                        <span class="ml-3 font-medium text-sm text-slate-300 group-hover:text-white">Frente de Caixa</span>
+                    </a>
+
+                    <a href="#" id="navPedidos" class="flex items-center p-3 rounded-xl hover:bg-slate-800 transition group nav-item mb-1" data-section="pedidos">
+                        <i class="fas fa-receipt w-6 text-center text-slate-400 group-hover:text-cyan-400 transition"></i>
+                        <span class="ml-3 font-medium text-sm text-slate-300 group-hover:text-white">Pedidos</span>
+                    </a>
+
+                    <a href="#" id="navEncomendas" class="flex items-center p-3 rounded-xl hover:bg-slate-800 transition group nav-item mb-1" data-section="encomendas">
+                        <i class="fas fa-calendar-alt w-6 text-center text-slate-400 group-hover:text-cyan-400 transition"></i>
+                        <span class="ml-3 font-medium text-sm text-slate-300 group-hover:text-white">Encomendas</span>
+                    </a>
+
+                    <a href="#" id="navClientes" class="flex items-center p-3 rounded-xl hover:bg-slate-800 transition group nav-item mb-1" data-section="clientes">
+                        <i class="fas fa-users w-6 text-center text-slate-400 group-hover:text-cyan-400 transition"></i>
+                        <span class="ml-3 font-medium text-sm text-slate-300 group-hover:text-white">Clientes</span>
+                    </a>
+
+                    <div class="my-4 border-t border-slate-800"></div>
+
+                    <a href="#" id="navConversas" class="flex items-center p-3 rounded-xl hover:bg-slate-800 transition group nav-item mb-1" data-section="conversas">
+                        <i class="fas fa-comments w-6 text-center text-slate-400 group-hover:text-cyan-400 transition"></i>
+                        <span class="ml-3 font-medium text-sm text-slate-300 group-hover:text-white">Chat Inteligente</span>
+                    </a>
+
+                    <a href="#" id="navWhatsapp" class="flex items-center p-3 rounded-xl hover:bg-slate-800 transition group nav-item mb-1" data-section="whatsapp">
+                        <i class="fab fa-whatsapp w-6 text-center text-slate-400 group-hover:text-green-400 transition"></i>
+                        <span class="ml-3 font-medium text-sm text-slate-300 group-hover:text-white">Conexão</span>
+                    </a>
+
+                    <a href="#" id="navRelatorios" class="flex items-center p-3 rounded-xl hover:bg-slate-800 transition group nav-item mb-1" data-section="relatorios">
+                        <i class="fas fa-chart-line w-6 text-center text-slate-400 group-hover:text-cyan-400 transition"></i>
+                        <span class="ml-3 font-medium text-sm text-slate-300 group-hover:text-white">Relatórios</span>
+                    </a>
+
+                    <a href="#" id="navConfig" class="flex items-center p-3 rounded-xl hover:bg-slate-800 transition group nav-item mb-1" data-section="config">
+                        <i class="fas fa-cog w-6 text-center text-slate-400 group-hover:text-yellow-400 transition"></i>
+                        <span class="ml-3 font-medium text-sm text-slate-300 group-hover:text-white">Configuração</span>
+                    </a>
+                </nav>
+            </div>
+            
+            <button id="logoutButtonSidebar" class="flex items-center p-3 rounded-xl hover:bg-red-900/30 text-red-400 hover:text-red-300 transition w-full mt-auto group">
+                <i class="fas fa-sign-out-alt w-6 text-center group-hover:rotate-180 transition-transform"></i>
+                <span class="ml-3 font-medium text-sm">Sair</span>
+            </button>
+        </aside>
+
+        <!-- AREA DE CONTEÚDO -->
+        <div id="contentArea" class="flex-1 flex flex-col bg-purple-50 overflow-hidden relative">
+            
+            <!-- Header Topo -->
+            <header class="bg-white px-8 py-4 shadow-sm flex justify-between items-center z-10 border-b border-purple-100">
+                <div>
+                    <h2 id="currentSectionTitle" class="text-xl font-bold text-gray-800 tracking-tight">Visão Geral</h2>
+                    <p class="text-xs text-gray-400">Gerenciador de Pedidos</p>
+                </div>
+                <div class="flex items-center gap-4">
+                    <div class="text-right hidden md:block">
+                        <p class="text-xs font-bold text-gray-600" id="userEmail">Admin</p>
+                        <p class="text-[10px] text-purple-500 font-bold uppercase">Gerente</p>
+                    </div>
+                    <div class="h-10 w-10 rounded-full bg-purple-100 border-2 border-purple-200 flex items-center justify-center text-purple-600">
+                        <i class="fas fa-user"></i>
+                    </div>
+                </div>
+            </header>
+
+            <!-- Main Scrollable Area -->
+            <main class="flex-1 overflow-y-auto p-6 scroll-smooth custom-scrollbar relative">
+                
+                <!-- 1. DASHBOARD -->
+                <section id="sectionDashboard" class="content-section">
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+                        <!-- Card Pedidos -->
+                        <div id="dashCardOrders" class="bg-white p-6 rounded-2xl shadow-sm border border-purple-100 flex justify-between items-center cursor-pointer hover:shadow-md transition">
+                            <div>
+                                <p class="text-xs font-bold text-gray-400 uppercase tracking-wide">Pedidos Abertos</p>
+                                <h3 class="text-3xl font-black text-gray-800 mt-1" id="dashOpenOrders">0</h3>
+                            </div>
+                            <div class="w-12 h-12 bg-purple-50 rounded-xl flex items-center justify-center text-purple-600">
+                                <i class="fas fa-receipt text-xl"></i>
+                            </div>
+                        </div>
+
+                        <!-- Card Clientes -->
+                        <div id="dashCardClients" class="bg-white p-6 rounded-2xl shadow-sm border border-emerald-100 flex justify-between items-center cursor-pointer hover:shadow-md transition">
+                            <div>
+                                <p class="text-xs font-bold text-gray-400 uppercase tracking-wide">Clientes Totais</p>
+                                <h3 class="text-3xl font-black text-gray-800 mt-1" id="dashTotalClients">0</h3>
+                            </div>
+                            <div class="w-12 h-12 bg-emerald-50 rounded-xl flex items-center justify-center text-emerald-600">
+                                <i class="fas fa-users text-xl"></i>
+                            </div>
+                        </div>
+
+                        <!-- Card Bot Status (CIANO/GELO) -->
+                        <div id="dashCardStatus" class="bg-white p-6 rounded-2xl shadow-sm border border-cyan-100 flex justify-between items-center cursor-pointer hover:shadow-md transition">
+                            <div>
+                                <p class="text-xs font-bold text-gray-400 uppercase tracking-wide">IA / WhatsApp</p>
+                                <h3 class="text-xl font-bold text-gray-800 mt-2" id="dashNextSlot">Verificando...</h3>
+                            </div>
+                            <div class="w-12 h-12 bg-cyan-50 rounded-xl flex items-center justify-center text-cyan-600 animate-pulse">
+                                <i class="fas fa-robot text-xl"></i>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Gráfico -->
+                    <div class="bg-white p-6 rounded-2xl shadow-sm border border-purple-100">
+                        <div class="flex justify-between items-center mb-6">
+                            <div>
+                                <h3 class="text-lg font-bold text-gray-800">Fluxo de Vendas</h3>
+                                <p class="text-xs text-gray-400">Últimos 7 dias</p>
+                            </div>
+                        </div>
+                        <div class="relative w-full h-80">
+                            <canvas id="salesChart"></canvas>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 2. PEDIDOS (KANBAN + MANUAL) -->
+                <section id="sectionPedidos" class="content-section hidden flex flex-col h-full gap-6">
+                    <!-- Kanban Board - CORREÇÃO DE SCROLL AQUI -->
+                    <div id="kanbanBoard" class="flex-1 grid grid-cols-4 gap-4 overflow-hidden min-h-[400px] pt-2">
+                        <!-- Coluna Pendente -->
+                        <div class="kanban-col bg-slate-50 border border-slate-200 rounded-xl flex flex-col p-3 h-full min-h-0">
+                            <div class="kanban-col-title text-slate-500 font-bold text-xs uppercase mb-3 flex justify-between flex-shrink-0">
+                                <span><i class="fas fa-clock mr-1"></i> Pendente</span>
+                                <span id="count-pending" class="bg-slate-200 px-2 rounded-full text-[10px]">0</span>
+                            </div>
+                            <div id="col-pending" class="flex-1 overflow-y-auto space-y-3 custom-scrollbar pr-1"></div>
+                        </div>
+
+                        <!-- Coluna Preparo -->
+                        <div class="kanban-col bg-orange-50 border border-orange-100 rounded-xl flex flex-col p-3 h-full min-h-0">
+                            <div class="kanban-col-title text-orange-600 font-bold text-xs uppercase mb-3 flex justify-between flex-shrink-0">
+                                <span><i class="fas fa-blender mr-1"></i> Preparo</span>
+                                <span id="count-prep" class="bg-orange-200 px-2 rounded-full text-[10px]">0</span>
+                            </div>
+                            <div id="col-prep" class="flex-1 overflow-y-auto space-y-3 custom-scrollbar pr-1"></div>
+                        </div>
+
+                        <!-- Coluna Envio/Pronto -->
+                        <div class="kanban-col bg-cyan-50 border border-cyan-100 rounded-xl flex flex-col p-3 h-full min-h-0">
+                            <div class="kanban-col-title text-cyan-600 font-bold text-xs uppercase mb-3 flex justify-between flex-shrink-0">
+                                <span><i class="fas fa-motorcycle mr-1"></i> Envio/Pronto</span>
+                                <span id="count-sent" class="bg-cyan-200 px-2 rounded-full text-[10px]">0</span>
+                            </div>
+                            <div id="col-sent" class="flex-1 overflow-y-auto space-y-3 custom-scrollbar pr-1"></div>
+                        </div>
+
+                        <!-- Coluna Concluído -->
+                        <div class="kanban-col bg-emerald-50 border border-emerald-100 rounded-xl flex flex-col p-3 h-full min-h-0">
+                            <div class="kanban-col-title text-emerald-600 font-bold text-xs uppercase mb-3 flex justify-between flex-shrink-0">
+                                <span><i class="fas fa-check-circle mr-1"></i> Concluído</span>
+                                <span id="count-done" class="bg-emerald-200 px-2 rounded-full text-[10px]">0</span>
+                            </div>
+                            <div id="col-done" class="flex-1 overflow-y-auto space-y-3 custom-scrollbar pr-1"></div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 3. POS -->
+                <section id="sectionPos" class="content-section hidden h-full flex gap-6 overflow-hidden">
+                    <!-- Esquerda: Catálogo -->
+                    <div class="flex-1 flex flex-col bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
+                        <div class="p-4 border-b border-gray-100 flex gap-4 bg-gray-50">
+                            <div class="relative flex-1">
+                                <i class="fas fa-search absolute left-4 top-3 text-gray-400"></i>
+                                <input type="text" id="posSearchInput" placeholder="Buscar picolé, pote..." 
+                                    class="w-full pl-10 pr-4 py-2 border border-gray-200 rounded-xl focus:ring-2 focus:ring-purple-500 outline-none text-sm">
+                            </div>
+                        </div>
+                        <div id="posProductGrid" class="flex-1 overflow-y-auto p-4 grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 custom-scrollbar content-start">
+                            <!-- Cards Injetados via JS -->
+                        </div>
+                    </div>
+
+                    <!-- Direita: Carrinho -->
+                    <div class="w-96 flex flex-col bg-slate-900 rounded-2xl shadow-2xl overflow-hidden text-white border-l-4 border-purple-500">
+                        <div class="p-4 bg-slate-800 border-b border-slate-700">
+                            <label class="text-[10px] font-bold text-slate-400 uppercase">Cliente</label>
+                            <select id="posClientSelect" class="w-full bg-slate-900 border border-slate-600 rounded-lg p-2 text-sm mt-1 focus:border-purple-500 outline-none"></select>
+                        </div>
+                        <div id="posCartList" class="flex-1 overflow-y-auto p-4 space-y-2 custom-scrollbar">
+                            <div id="posEmptyCart" class="h-full flex flex-col items-center justify-center text-slate-600 space-y-2 opacity-60">
+                                <i class="fas fa-shopping-basket text-4xl"></i>
+                                <p class="text-sm">Seu carrinho está vazio</p>
+                            </div>
+                        </div>
+                        <div class="p-6 bg-slate-800 shadow-lg space-y-4">
+                            <div class="flex justify-between items-center text-slate-400 text-sm">
+                                <span>Subtotal</span>
+                                <span id="posSubtotal">R$ 0,00</span>
+                            </div>
+                            <div class="flex justify-between items-center text-3xl font-bold text-purple-400">
+                                <span>Total</span>
+                                <span id="posTotal">R$ 0,00</span>
+                            </div>
+                            
+                            <div class="grid grid-cols-2 gap-2 pt-2">
+                                <button class="pos-pay-btn flex flex-col items-center p-2 rounded-lg border border-slate-600 hover:bg-slate-700 transition" data-method="Pix">
+                                    <i class="fas fa-qrcode text-emerald-400 mb-1"></i><span class="text-[10px]">PIX</span>
+                                </button>
+                                <button class="pos-pay-btn flex flex-col items-center p-2 rounded-lg border border-slate-600 hover:bg-slate-700 transition" data-method="Cartão">
+                                    <i class="fas fa-credit-card text-blue-400 mb-1"></i><span class="text-[10px]">CARTÃO</span>
+                                </button>
+                                <button class="pos-pay-btn flex flex-col items-center p-2 rounded-lg border border-slate-600 hover:bg-slate-700 transition" data-method="Dinheiro">
+                                    <i class="fas fa-money-bill-wave text-green-400 mb-1"></i><span class="text-[10px]">DINHEIRO</span>
+                                </button>
+                                <button id="btnPosClear" class="flex flex-col items-center p-2 rounded-lg border border-red-900/50 text-red-400 hover:bg-red-900/20 transition">
+                                    <i class="fas fa-trash mb-1"></i><span class="text-[10px]">LIMPAR</span>
+                                </button>
+                            </div>
+
+                            <button id="btnPosFinalize" class="w-full bg-purple-600 hover:bg-purple-700 text-white font-bold py-4 rounded-xl shadow-lg transition transform active:scale-95 flex items-center justify-center gap-2">
+                                <i class="fas fa-check-circle"></i> FINALIZAR VENDA (F10)
+                            </button>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 4. ENCOMENDAS -->
+                <section id="sectionEncomendas" class="content-section hidden h-full flex flex-col">
+                    <div class="flex justify-between items-center mb-6">
+                        <div>
+                            <h2 class="text-2xl font-bold text-gray-800">Calendário de Pedidos</h2>
+                            <p class="text-sm text-gray-500" id="currentMonthLabel">...</p>
+                        </div>
+                        <div class="flex gap-2 bg-white p-1 rounded-lg border shadow-sm">
+                            <button id="btnPrevMonth" class="p-2 hover:bg-gray-50 rounded"><i class="fas fa-chevron-left text-gray-600"></i></button>
+                            <button id="btnNextMonth" class="p-2 hover:bg-gray-50 rounded"><i class="fas fa-chevron-right text-gray-600"></i></button>
+                        </div>
+                        <button id="btnNewEncomenda" class="ml-4 bg-purple-600 text-white px-4 py-2 rounded-lg hover:bg-purple-700 font-bold shadow-md">
+                            <i class="fas fa-plus mr-2"></i>Agendar
+                        </button>
+                    </div>
+                    <div class="flex-1 bg-white rounded-2xl shadow-sm border border-gray-100 p-6 flex flex-col overflow-hidden">
+                        <div class="grid grid-cols-7 gap-1 text-center mb-4">
+                            <div class="text-xs font-bold text-gray-300 uppercase">Dom</div>
+                            <div class="text-xs font-bold text-gray-300 uppercase">Seg</div>
+                            <div class="text-xs font-bold text-gray-300 uppercase">Ter</div>
+                            <div class="text-xs font-bold text-gray-300 uppercase">Qua</div>
+                            <div class="text-xs font-bold text-gray-300 uppercase">Qui</div>
+                            <div class="text-xs font-bold text-gray-300 uppercase">Sex</div>
+                            <div class="text-xs font-bold text-gray-300 uppercase">Sáb</div>
+                        </div>
+                        <div id="calendarGrid" class="grid grid-cols-7 gap-2 flex-1 overflow-y-auto custom-scrollbar"></div>
+                    </div>
+                </section>
+
+                <!-- 5. CLIENTES -->
+                <section id="sectionClientes" class="content-section hidden">
+                    <div class="bg-white rounded-2xl shadow-sm p-6 mb-6 border border-gray-100">
+                        <h3 class="text-xs font-bold text-gray-400 uppercase mb-4"><i class="fas fa-user-plus mr-1"></i> Cadastrar Cliente</h3>
+                        <form id="addClientForm" class="space-y-4">
+                            <div class="flex flex-col md:flex-row gap-4 items-start">
+                                <div class="w-full md:w-24">
+                                    <label class="text-xs font-bold text-gray-500">DDI</label>
+                                    <select id="addClientCountryCode" class="w-full border rounded-lg p-2 bg-gray-50 text-sm h-[40px]"><option value="55" selected>🇧🇷 +55</option></select>
+                                </div>
+                                <div class="flex-1 w-full">
+                                    <label class="text-xs font-bold text-gray-500">Nome</label>
+                                    <input type="text" id="clientNameInput" required class="w-full border rounded-lg p-2 text-sm h-[40px]" placeholder="Nome Completo">
+                                </div>
+                                <div class="flex-1 w-full">
+                                    <label class="text-xs font-bold text-gray-500">Telefone (Whatsapp)</label>
+                                    <input type="text" id="clientPhoneInput" required class="w-full border rounded-lg p-2 text-sm h-[40px]" placeholder="DDD + Número">
+                                </div>
+                            </div>
+                            <div>
+                                <label class="text-xs font-bold text-gray-500">Endereço Completo (Opcional)</label>
+                                <input type="text" id="clientAddressInput" class="w-full border rounded-lg p-2 text-sm h-[40px]" placeholder="Rua, Número, Bairro e Complemento">
+                            </div>
+                            <div class="flex justify-end">
+                                <button type="submit" class="bg-purple-600 text-white px-6 py-2 rounded-lg hover:bg-purple-700 font-bold h-[40px] shadow-md transition transform active:scale-95">
+                                    Salvar Cliente
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                    <div class="space-y-2" id="clientsList"></div>
+                    <p id="noClientsMessage" class="hidden text-center text-gray-400 mt-10">Nenhum cliente na base de dados.</p>
+                </section>
+
+                <!-- 6. WHATSAPP -->
+                <section id="sectionWhatsapp" class="content-section hidden flex flex-col items-center justify-center h-full">
+                    <div class="bg-white p-12 rounded-3xl shadow-xl text-center max-w-md w-full border border-gray-100 relative overflow-hidden">
+                        <div class="absolute top-0 left-0 w-full h-2 bg-gradient-to-r from-green-400 to-emerald-600"></div>
+                        <div class="mb-8">
+                            <div class="w-24 h-24 bg-green-50 rounded-full flex items-center justify-center mx-auto mb-4 animate-bounce">
+                                <i class="fab fa-whatsapp text-5xl text-green-600"></i>
+                            </div>
+                            <h3 class="text-2xl font-bold text-gray-800">Conexão WhatsApp</h3>
+                            <p class="text-sm text-gray-500">Escaneie o QR Code para conectar o robô.</p>
+                        </div>
+                        <div class="mb-6">
+                            <p class="text-xs font-bold text-gray-400 uppercase mb-2">Status da Conexão</p>
+                            <p class="text-lg"><span id="whatsappStatusText" class="font-bold text-gray-400">Desconectado</span></p>
+                        </div>
+
+                        <div id="whatsappQrContainer" class="hidden mb-6 flex flex-col items-center p-4 border rounded-xl bg-gray-50">
+                            <canvas id="whatsappQrCodeCanvas" class="rounded-lg shadow-sm"></canvas>
+                        </div>
+
+                        <div class="space-y-3 w-full">
+                            <button id="whatsappReconnectButton" class="hidden w-full bg-green-600 text-white py-3 rounded-xl hover:bg-green-700 font-bold shadow-lg transition">
+                                Iniciar Conexão
+                            </button>
+                            <button id="whatsappLogoutButton" class="hidden w-full border border-red-200 text-red-500 py-3 rounded-xl hover:bg-red-50 font-bold transition">
+                                Desconectar
+                            </button>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- 7. CONVERSAS -->
+                <section id="sectionConversas" class="content-section hidden h-[calc(100vh-140px)] flex border border-gray-200 rounded-2xl overflow-hidden shadow-sm bg-white">
+                    <!-- Lista Lateral -->
+                    <div class="w-80 border-r bg-gray-50 flex flex-col">
+                        <div class="p-4 border-b bg-white">
+                            <h4 class="text-xs font-bold text-gray-400 uppercase tracking-wide">Conversas Recentes</h4>
+                        </div>
+                        <div id="conversationsList" class="flex-1 overflow-y-auto custom-scrollbar"></div>
+                    </div>
+
+                    <!-- Janela de Chat -->
+                    <div id="chatWindow" class="flex-1 flex flex-col hidden bg-slate-50 relative">
+                        <!-- Header Chat -->
+                        <div class="p-4 bg-white border-b flex justify-between items-center shadow-sm z-10">
+                            <div class="flex items-center gap-3">
+                                <div class="w-10 h-10 rounded-full bg-purple-100 flex items-center justify-center text-purple-600 font-bold text-lg"><i class="fas fa-user"></i></div>
+                                <div><h4 id="currentChatClientName" class="font-bold text-gray-800 leading-tight">Cliente</h4><span class="text-xs text-green-500 font-medium flex items-center gap-1"><i class="fas fa-circle text-[8px]"></i> Online</span></div>
+                            </div>
+                            <div class="flex items-center gap-3 bg-gray-100 px-4 py-2 rounded-full border border-gray-200">
+                                <span class="text-xs font-bold text-gray-500 uppercase">Robô Ativo</span>
+                                <div class="relative inline-block w-10 align-middle select-none">
+                                    <input type="checkbox" id="aiToggleSwitch" class="toggle-checkbox absolute block w-5 h-5 rounded-full bg-white border-4 appearance-none cursor-pointer border-gray-300"/>
+                                    <label for="aiToggleSwitch" class="toggle-label block overflow-hidden h-5 rounded-full bg-gray-300 cursor-pointer"></label>
+                                </div>
+                            </div>
+                        </div>
+                        <div id="messagesContainer" class="flex-1 p-6 overflow-y-auto flex flex-col space-y-3 custom-scrollbar bg-slate-50"></div>
+                        <div class="p-4 bg-white border-t flex items-end gap-3">
+                            <button id="btnDailyShowcase" class="bg-cyan-50 text-cyan-600 w-10 h-10 rounded-xl hover:bg-cyan-100 transition flex items-center justify-center border border-cyan-200 shadow-sm" title="Enviar Vitrine (Picolés)"><i class="fas fa-layer-group"></i></button>
+                            <button id="btnQuickGallery" class="bg-purple-50 text-purple-600 w-10 h-10 rounded-xl hover:bg-purple-100 transition flex items-center justify-center border border-purple-200 shadow-sm" title="Enviar Foto Produto"><i class="fas fa-image"></i></button>
+                            <div class="flex-1 relative"><textarea id="chatMessageInput" rows="1" class="w-full border rounded-xl pl-4 pr-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-purple-500 resize-none bg-gray-50" placeholder="Digite sua mensagem... (Enter para enviar)"></textarea></div>
+                            <button id="sendChatMessageButton" class="bg-purple-600 text-white w-12 h-10 rounded-xl hover:bg-purple-700 shadow-md transition flex items-center justify-center"><i class="fas fa-paper-plane"></i></button>
+                        </div>
+                    </div>
+                    <div id="emptyChatState" class="flex-1 flex flex-col items-center justify-center text-gray-300 bg-white"><i class="far fa-comments text-6xl mb-4 text-purple-200"></i><p class="font-medium text-gray-400">Selecione uma conversa para atender</p></div>
+                </section>
+
+                <!-- 8. RELATÓRIOS -->
+                <section id="sectionRelatorios" class="content-section hidden space-y-6">
+                    <div class="flex justify-between items-center">
+                        <h2 class="text-xl font-bold text-gray-800">Business Intelligence</h2>
+                        <div class="flex items-center gap-4">
+                            <button id="btnIdPrintReport" class="bg-white border border-gray-200 text-gray-600 px-4 py-2 rounded-lg hover:bg-gray-50 transition text-xs font-bold flex items-center gap-2 shadow-sm"><i class="fas fa-file-pdf text-red-500"></i> Exportar Relatório</button>
+                            <div class="flex bg-white rounded-lg p-1 shadow-sm border border-gray-200">
+                                <button class="report-period-btn px-4 py-1 text-xs rounded-md bg-purple-600 text-white font-bold" data-days="7">7 Dias</button>
+                                <button class="report-period-btn px-4 py-1 text-xs rounded-md hover:bg-gray-100 text-gray-600" data-days="30">30 Dias</button>
+                                <button class="report-period-btn px-4 py-1 text-xs rounded-md hover:bg-gray-100 text-gray-600" data-days="90">90 Dias</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+                        <div class="bg-white p-6 rounded-2xl shadow-sm border-t-4 border-purple-500"><p class="text-xs font-bold text-gray-400 uppercase">Faturamento Bruto</p><h3 class="text-3xl font-black text-gray-800 mt-2" id="repTotalRevenue">R$ 0,00</h3></div>
+                        <div class="bg-white p-6 rounded-2xl shadow-sm border-t-4 border-blue-500"><p class="text-xs font-bold text-gray-400 uppercase">Pedidos Realizados</p><h3 class="text-3xl font-black text-gray-800 mt-2" id="repOrderCount">0</h3></div>
+                        <div class="bg-white p-6 rounded-2xl shadow-sm border-t-4 border-emerald-500"><p class="text-xs font-bold text-gray-400 uppercase">Ticket Médio</p><h3 class="text-3xl font-black text-gray-800 mt-2" id="repAvgTicket">R$ 0,00</h3></div>
+                    </div>
+                    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                        <div class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100"><h4 class="font-bold text-gray-700 mb-4">Evolução Diária</h4><div class="h-64"><canvas id="chartRevenue"></canvas></div></div>
+                        <div class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100"><h4 class="font-bold text-gray-700 mb-4">Meios de Pagamento</h4><div class="h-64"><canvas id="chartPayments"></canvas></div></div>
+                    </div>
+                    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                        <div class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100"><h4 class="font-bold text-gray-700 mb-4 flex items-center gap-2"><i class="fas fa-crown text-yellow-400"></i> Top Clientes</h4><div id="repTopClientsList" class="space-y-1"></div></div>
+                        <div class="bg-white p-6 rounded-2xl shadow-sm border border-gray-100"><h4 class="font-bold text-gray-700 mb-4 flex items-center gap-2"><i class="fas fa-star text-purple-400"></i> Produtos Populares</h4><div id="repTopProductsList" class="space-y-1"></div></div>
+                    </div>
+                </section>
+
+                <!-- 9. CONFIGURAÇÃO -->
+                <section id="sectionConfig" class="content-section hidden">
+                    <div class="bg-white p-8 rounded-2xl shadow-lg max-w-5xl mx-auto border border-gray-100 min-h-[600px] flex flex-col relative overflow-hidden">
+                        <div class="text-center mb-8"><h2 class="text-2xl font-bold text-gray-800">Configuração da Loja</h2><p class="text-sm text-gray-400">Ajuste os parâmetros da IA e do Cardápio</p></div>
+                        <div class="mb-10 px-10 relative">
+                            <div class="relative w-full h-1 bg-gray-200 rounded overflow-hidden"><div id="stepperProgress" class="absolute top-0 left-0 h-full bg-purple-600 transition-all duration-500 ease-out" style="width: 0%"></div></div>
+                            <div class="flex justify-between -mt-3 relative z-10">
+                                <div class="step-indicator text-center cursor-default" data-step="1"><div class="w-6 h-6 rounded-full bg-white border-2 border-purple-600 mx-auto transition-colors duration-300"></div><span class="text-[10px] font-bold text-purple-600 mt-2 block uppercase tracking-wide">Identidade</span></div>
+                                <div class="step-indicator text-center cursor-default" data-step="2"><div class="w-6 h-6 rounded-full bg-white border-2 border-gray-300 mx-auto transition-colors duration-300"></div><span class="text-[10px] font-bold text-gray-400 mt-2 block uppercase tracking-wide">Cardápio Açaí</span></div>
+                                <div class="step-indicator text-center cursor-default" data-step="3"><div class="w-6 h-6 rounded-full bg-white border-2 border-gray-300 mx-auto transition-colors duration-300"></div><span class="text-[10px] font-bold text-gray-400 mt-2 block uppercase tracking-wide">Estoque</span></div>
+                                <div class="step-indicator text-center cursor-default" data-step="4"><div class="w-6 h-6 rounded-full bg-white border-2 border-gray-300 mx-auto transition-colors duration-300"></div><span class="text-[10px] font-bold text-gray-400 mt-2 block uppercase tracking-wide">Sistema</span></div>
+                            </div>
+                        </div>
+                        <form id="configForm" class="flex-1 flex flex-col">
+                            <div id="step-1" class="step-panel space-y-6 animate-fade-in">
+                                <div class="grid grid-cols-2 gap-6">
+                                    <div><label class="block text-xs font-bold text-gray-500 uppercase mb-1">Nome do Estabelecimento</label><input id="cfgStoreName" class="w-full border rounded-lg p-3 text-sm focus:ring-2 focus:ring-purple-500 outline-none" placeholder="Ex: Doce Floco"></div>
+                                    <div><label class="block text-xs font-bold text-gray-500 uppercase mb-1">Chave Pix</label><input id="cfgPixKey" class="w-full border rounded-lg p-3 text-sm bg-green-50 focus:ring-2 focus:ring-green-500 outline-none" placeholder="Email, CPF..."></div>
+                                </div>
+                                <div><label class="block text-xs font-bold text-gray-500 uppercase mb-1">Endereço (Retirada)</label><input id="cfgAddress" class="w-full border rounded-lg p-3 text-sm focus:ring-2 focus:ring-purple-500 outline-none"></div>
+                                <div><label class="block text-xs font-bold text-gray-500 uppercase mb-1">Mensagem de Boas-vindas</label><textarea id="cfgWelcomeMsg" class="w-full border rounded-lg p-3 text-sm focus:ring-2 focus:ring-purple-500 outline-none" rows="2" placeholder="Ex: Olá! Sou a assistente virtual da Doce Floco."></textarea></div>
+                                <div class="flex items-center gap-3 bg-gray-50 p-3 rounded-lg border border-gray-100"><input type="checkbox" id="cfgUseEmojis" class="w-5 h-5 accent-purple-600 rounded cursor-pointer"><label for="cfgUseEmojis" class="text-sm font-medium text-gray-700 cursor-pointer">Usar Emojis nas Respostas da IA (💜, 🍦, ❄️)</label></div>
+                            </div>
+                            <div id="step-2" class="step-panel hidden space-y-6 animate-fade-in">
+                                <div class="bg-purple-50 p-6 rounded-xl border border-purple-100 relative overflow-hidden">
+                                    <i class="fas fa-utensils text-6xl text-purple-200 absolute -right-4 -bottom-4 opacity-50"></i>
+                                    <div class="flex justify-between items-center mb-4">
+                                        <h3 class="text-sm font-bold text-purple-800 uppercase flex items-center gap-2"><i class="fas fa-wine-glass"></i> Montagem de Copos (Açaí)</h3>
+                                        <div class="flex items-center gap-2 z-10">
+                                            <span id="statusImgAcai" class="text-[10px] text-green-600 font-bold hidden bg-white px-2 py-1 rounded shadow-sm"><i class="fas fa-check-circle"></i> Imagem Salva</span>
+                                            <label class="cursor-pointer bg-white text-purple-600 px-3 py-1 rounded-lg text-xs font-bold border border-purple-200 shadow-sm hover:bg-purple-100 transition"><i class="fas fa-upload mr-1"></i> Upload Tabela <input type="file" id="cfgImgAcai" accept="image/*" class="hidden"></label>
+                                        </div>
+                                    </div>
+                                    <div class="space-y-4 relative z-10">
+                                        <div><label class="text-[10px] font-bold text-purple-400 uppercase">Tamanhos (Ex: 300ml=12)</label><div id="chipsAcaiSizeContainer" class="flex flex-wrap gap-2 mb-2 min-h-[30px]"></div><input id="inpAcaiSize" class="w-full text-xs p-2 rounded border border-purple-200 focus:outline-none focus:ring-2 focus:ring-purple-400 bg-white/80" placeholder="Digite e aperte Enter..."></div>
+                                    </div>
+                                </div>
+                                <div class="grid grid-cols-2 gap-6">
+                                    <div class="bg-white p-4 rounded-xl border border-gray-200 shadow-sm"><label class="text-xs font-bold text-gray-500 uppercase block mb-2">Complementos Grátis</label><div id="chipsFreeAddonContainer" class="flex flex-wrap gap-2 mb-2 min-h-[40px]"></div><input id="inpFreeAddon" class="w-full text-xs p-2 border-b border-gray-200 focus:border-purple-500 outline-none bg-transparent" placeholder="Ex: Leite em pó..."></div>
+                                    <div class="bg-white p-4 rounded-xl border border-gray-200 shadow-sm"><label class="text-xs font-bold text-gray-500 uppercase block mb-2">Adicionais Pagos (Upsell)</label><div id="chipsPaidAddonContainer" class="flex flex-wrap gap-2 mb-2 min-h-[40px]"></div><input id="inpPaidAddon" class="w-full text-xs p-2 border-b border-gray-200 focus:border-purple-500 outline-none bg-transparent" placeholder="Ex: Nutella=5..."></div>
+                                </div>
+                                <div><label class="text-xs font-bold text-gray-500 uppercase block mb-1">Taxa de Entrega (R$)</label><input type="number" id="cfgDeliveryFee" class="w-32 border rounded-lg p-2 text-sm font-bold" placeholder="0.00"></div>
+                            </div>
+                            <div id="step-3" class="step-panel hidden flex flex-col h-full animate-fade-in">
+                                <div class="flex gap-4 mb-4 items-end bg-gray-50 p-4 rounded-xl border border-gray-200">
+                                    <div class="flex-1"><label class="text-[10px] font-bold text-gray-500 uppercase">Nome do Produto</label><input id="prodName" class="w-full border-b-2 border-gray-300 bg-transparent py-1 text-sm focus:border-purple-500 outline-none" placeholder="Ex: Picolé de Coco"></div>
+                                    <div class="w-24"><label class="text-[10px] font-bold text-gray-500 uppercase">Preço</label><input id="prodPrice" type="number" class="w-full border-b-2 border-gray-300 bg-transparent py-1 text-sm focus:border-purple-500 outline-none" placeholder="0.00"></div>
+                                    <button type="button" id="btnAddProduct" class="bg-green-500 text-white w-10 h-10 rounded-full hover:bg-green-600 shadow-md flex items-center justify-center transition transform hover:rotate-90"><i class="fas fa-plus"></i></button>
+                                </div>
+                                <div id="productsListConfig" class="flex-1 overflow-y-auto grid grid-cols-3 gap-3 custom-scrollbar content-start p-1"></div>
+                            </div>
+                            <div id="step-4" class="step-panel hidden space-y-6 animate-fade-in">
+                                <div class="bg-slate-50 p-5 rounded-xl border border-slate-200 shadow-sm">
+                                    <h4 class="text-sm font-bold text-slate-700 mb-4 flex items-center gap-2"><i class="fas fa-brain text-purple-500"></i> Inteligência Artificial (Gemini)</h4>
+                                    <label class="block text-xs font-bold text-gray-400 mb-1">API KEY</label>
+                                    <input type="password" id="cfgApiKey" class="w-full border rounded-lg p-3 text-sm bg-white focus:ring-2 focus:ring-purple-500 outline-none" placeholder="Cole sua chave aqui...">
+                                </div>
+                                <div class="bg-slate-50 p-5 rounded-xl border border-slate-200 shadow-sm">
+                                    <h4 class="text-sm font-bold text-slate-700 mb-4 flex items-center gap-2"><i class="fas fa-print text-gray-600"></i> Impressão Térmica</h4>
+                                    <div class="flex gap-3 mb-4">
+                                        <select id="cfgPrinterSelect" class="flex-1 border rounded-lg p-2 text-sm bg-white"></select>
+                                        <button type="button" id="btnRefreshPrinters" class="text-gray-500 hover:text-gray-800 px-2"><i class="fas fa-sync-alt"></i></button>
+                                    </div>
+                                    <div class="flex items-center gap-3">
+                                        <div class="relative inline-block w-10 align-middle select-none">
+                                            <input type="checkbox" id="cfgAutoPrint" class="toggle-checkbox absolute block w-5 h-5 rounded-full bg-white border-4 appearance-none cursor-pointer border-gray-300"/>
+                                            <label for="cfgAutoPrint" class="toggle-label block overflow-hidden h-5 rounded-full bg-gray-300 cursor-pointer"></label>
+                                        </div>
+                                        <span class="text-xs font-bold text-gray-600">Imprimir Automaticamente ao confirmar pedido</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="mt-auto pt-6 border-t border-gray-100 flex justify-between items-center">
+                                <button type="button" id="prev-step-btn" class="hidden text-gray-500 hover:text-gray-800 text-sm font-medium px-4 py-2 rounded-lg hover:bg-gray-100 transition"><i class="fas fa-arrow-left mr-2"></i> Voltar</button>
+                                <div class="flex gap-3 ml-auto">
+                                    <button type="button" id="next-step-btn" class="bg-slate-800 text-white px-8 py-3 rounded-lg hover:bg-slate-700 font-bold shadow-lg transition">Próximo <i class="fas fa-arrow-right ml-2"></i></button>
+                                    <button type="submit" id="btnSaveConfig" class="hidden bg-purple-600 text-white px-8 py-3 rounded-lg hover:bg-purple-700 font-bold shadow-lg transition flex items-center gap-2"><i class="fas fa-save"></i> Salvar Tudo</button>
+                                </div>
+                            </div>
+                        </form>
+                    </div>
+                </section>
+            </main>
+        </div>
+    </div>
+
+    <!-- =================================================================================
+         MODAIS (POP-UPS)
+    ================================================================================== -->
+    
+    <!-- Modal Editar Cliente -->
+    <div id="editClientModal" class="modal hidden">
+        <div class="modal-content">
+            <h3 class="text-lg font-bold mb-4 text-gray-800 border-b pb-2">Editar Cliente</h3>
+            <form id="editClientForm" class="space-y-4">
+                <input type="hidden" id="editClientId">
+                <div class="flex gap-3">
+                    <select id="editClientCountryCode" class="border rounded-lg p-2 bg-gray-50 w-24 text-sm"><option value="55">🇧🇷 +55</option></select>
+                    <input type="text" id="editClientName" class="border rounded-lg p-2 flex-1 text-sm focus:border-purple-500 outline-none" placeholder="Nome">
+                </div>
+                <div><label class="block text-xs font-bold text-gray-400 uppercase mb-1">Telefone</label><input type="text" id="editClientPhone" class="border rounded-lg p-2 w-full text-sm focus:border-purple-500 outline-none"></div>
+                <div><label class="block text-xs font-bold text-gray-400 uppercase mb-1">Endereço Salvo</label><input type="text" id="editClientAddress" class="border rounded-lg p-2 w-full text-sm focus:border-purple-500 outline-none" placeholder="Rua, Número..."></div>
+                <div class="bg-gray-50 p-3 rounded-lg border border-gray-100 mt-2"><p class="text-[10px] font-bold text-gray-400 mb-2 uppercase">Histórico Recente</p><div id="clientAppointmentsHistory" class="text-xs text-gray-600 max-h-32 overflow-y-auto space-y-2 custom-scrollbar"></div></div>
+                <div class="flex justify-end gap-3 pt-2">
+                    <button type="button" id="cancelEditClientButton" class="px-4 py-2 text-gray-500 hover:bg-gray-100 rounded-lg text-sm font-medium transition">Cancelar</button>
+                    <button type="submit" class="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 text-sm font-medium shadow-md transition">Salvar Alterações</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Modal Editar Pedido -->
+    <div id="editOrderModal" class="modal hidden">
+        <div class="modal-content max-w-2xl">
+            <div class="flex justify-between items-center mb-4 border-b pb-3">
+                <h3 class="text-lg font-bold text-gray-800">Detalhes do Pedido</h3>
+                <span id="modalStatusBadge" class="text-[10px] px-3 py-1 rounded-full bg-gray-100 text-gray-500 font-bold uppercase tracking-wider">STATUS</span>
+            </div>
+            <form id="editOrderForm" class="space-y-4">
+                <input type="hidden" id="editOrderId">
+                <div><label class="block text-xs font-bold text-gray-400 uppercase mb-1">Itens do Pedido</label><textarea id="editOrderItems" class="w-full border rounded-lg p-3 text-sm bg-gray-50 focus:bg-white focus:ring-2 focus:ring-purple-500 outline-none transition" rows="3"></textarea></div>
+                <div class="flex gap-4">
+                    <div class="flex-1"><label class="block text-xs font-bold text-gray-400 uppercase mb-1">Total (R$)</label><input type="number" step="0.50" id="editOrderTotal" class="w-full border rounded-lg p-2 text-sm font-bold text-gray-800"></div>
+                    <div class="flex-1">
+                        <label class="block text-xs font-bold text-gray-400 uppercase mb-1">Forma Pagamento</label>
+                        <select id="editOrderPayment" class="w-full border rounded-lg p-2 text-sm bg-white"><option value="Pix">Pix</option><option value="Dinheiro">Dinheiro</option><option value="Cartão">Cartão</option></select>
+                    </div>
+                </div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div><label class="block text-xs font-bold text-gray-400 uppercase mb-1">Data Agendada</label><input type="date" id="editOrderDate" class="w-full border rounded-lg p-2 text-sm"></div>
+                    <div><label class="block text-xs font-bold text-gray-400 uppercase mb-1">Método Entrega</label><input type="text" id="editOrderDelivery" class="w-full border rounded-lg p-2 text-sm"></div>
+                </div>
+                <div><label class="block text-xs font-bold text-gray-400 uppercase mb-1">Endereço de Entrega</label><input type="text" id="editOrderAddress" class="w-full border rounded-lg p-2 text-sm" placeholder="Rua, Número..."></div>
+                <div class="flex justify-between items-center pt-4 border-t mt-4">
+                    <div class="flex gap-2">
+                        <button type="button" id="btnModalDelete" class="w-10 h-10 flex items-center justify-center text-red-400 hover:bg-red-50 rounded-lg transition" title="Excluir"><i class="fas fa-trash-alt"></i></button>
+                        <button type="button" id="btnModalPrint" class="w-10 h-10 flex items-center justify-center text-gray-400 hover:bg-gray-100 rounded-lg transition" title="Imprimir"><i class="fas fa-print"></i></button>
+                    </div>
+                    <div class="flex gap-3">
+                        <button type="button" id="cancelEditOrderButton" class="px-5 py-2 text-gray-500 hover:bg-gray-100 rounded-lg text-sm font-bold transition">Fechar</button>
+                        <button type="submit" class="px-5 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 text-sm font-bold shadow-md transition transform active:scale-95">Salvar</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Modal Nova/Editar Encomenda (FESTAS) -->
+    <div id="encomendaModal" class="modal hidden">
+        <div class="modal-content max-w-2xl bg-white rounded-xl shadow-2xl">
+            <div class="flex justify-between items-center mb-4 border-b pb-3 p-4 bg-purple-50 rounded-t-xl">
+                <h3 class="text-lg font-bold text-purple-800"><i class="fas fa-glass-cheers mr-2"></i>Gestão de Encomenda (Festas)</h3>
+                <button id="closeEncomendaModal" class="text-gray-400 hover:text-red-500"><i class="fas fa-times"></i></button>
+            </div>
+            <form id="encomendaForm" class="p-6 space-y-4">
+                <input type="hidden" id="encId"> 
+                <div><label class="block text-xs font-bold text-gray-500 uppercase mb-1">Cliente</label><select id="encClientSelect" class="w-full border rounded-lg p-2 text-sm bg-white focus:ring-2 focus:ring-purple-500 outline-none"></select></div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div><label class="block text-xs font-bold text-gray-500 uppercase mb-1">Data do Evento</label><input type="date" id="encDate" required class="w-full border rounded-lg p-2 text-sm"></div>
+                    <div><label class="block text-xs font-bold text-gray-500 uppercase mb-1">Hora (Opcional)</label><input type="time" id="encTime" class="w-full border rounded-lg p-2 text-sm"></div>
+                </div>
+                <div><label class="block text-xs font-bold text-gray-500 uppercase mb-1">Itens do Pedido (Picolés/Potes)</label><textarea id="encItems" class="w-full border rounded-lg p-2 text-sm bg-gray-50 focus:bg-white transition" rows="2" placeholder="Ex: 50 Picolés Fruta, 30 Picolés Leite..."></textarea></div>
+                <div class="bg-orange-50 p-3 rounded-lg border border-orange-100">
+                    <label class="block text-xs font-bold text-orange-700 uppercase mb-1"><i class="fas fa-box-open mr-1"></i> Materiais Emprestados</label>
+                    <input type="text" id="encLoanedItems" class="w-full border border-orange-200 rounded-lg p-2 text-sm mb-2" placeholder="Ex: 1 Caixa Térmica, 2 Carrinhos...">
+                    <div class="flex items-center gap-2"><label class="text-xs font-bold text-gray-500">Data Devolução:</label><input type="date" id="encReturnDate" class="border rounded-lg p-1 text-sm bg-white"></div>
+                </div>
+                
+                <!-- AQUI ESTÁ A ALTERAÇÃO: 3 COLUNAS (TOTAL, PAGAMENTO, ENDEREÇO) -->
+                <div class="flex gap-4 items-end">
+                     <div class="w-1/3">
+                        <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Valor Total (R$)</label>
+                        <input type="number" step="0.50" id="encTotal" class="w-full border rounded-lg p-2 text-sm font-bold text-gray-800" placeholder="0.00">
+                    </div>
+                     <div class="w-1/3">
+                        <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Pagamento</label>
+                        <select id="encPayment" class="w-full border rounded-lg p-2 text-sm bg-white focus:border-purple-500 outline-none">
+                            <option value="Pix">Pix</option>
+                            <option value="Dinheiro">Dinheiro</option>
+                            <option value="Cartão">Cartão</option>
+                        </select>
+                    </div>
+                    <div class="flex-1">
+                        <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Endereço Entrega</label>
+                        <input type="text" id="encAddress" class="w-full border rounded-lg p-2 text-sm" placeholder="Opcional (Retirada)">
+                    </div>
+                </div>
+
+                <div class="flex justify-end gap-3 pt-4 border-t mt-2">
+                    <button type="button" id="btnDeleteEncomenda" class="hidden px-4 py-2 text-red-400 hover:bg-red-50 rounded-lg text-sm font-bold transition mr-auto">Excluir</button>
+                    <button type="submit" class="px-6 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 text-sm font-bold shadow-md transition transform active:scale-95">Salvar Encomenda</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Script Principal -->
+    <script type="module" src="./assets/js/core/App.js"></script>
+</body>
+</html>
