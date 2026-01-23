@@ -49,4 +49,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   updateScheduledOrder: (data) => ipcRenderer.invoke('update-scheduled-order', data),
   deleteScheduledOrder: (id) => ipcRenderer.invoke('delete-scheduled-order', id),
   printCloseRegister: (data) => ipcRenderer.invoke('print-close-register', data),
+  startMassSend: (message, recipients) => ipcRenderer.invoke('start-mass-send', message, recipients),
+  stopMassSend: () => ipcRenderer.invoke('stop-mass-send'),
+  onMassSendStatus: (callback) => ipcRenderer.on('mass-send-status', (event, status) => callback(status)),
 });

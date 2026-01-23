@@ -13,6 +13,7 @@ import { CalendarModule } from '../modules/CalendarModule.js';
 import { SettingsModule } from '../modules/SettingsModule.js';
 import { PosModule } from '../modules/PosModule.js';
 import { ReportsModule } from '../modules/ReportsModule.js';
+import { BroadcastModule } from '../modules/BroadcastModule.js';
 
 class App {
     constructor() {
@@ -28,7 +29,8 @@ class App {
             'encomendas': new CalendarModule(),
             'config': new SettingsModule(),
             'pos': new PosModule(),
-            'relatorios': new ReportsModule()
+            'relatorios': new ReportsModule(),
+            'broadcast': new BroadcastModule()
         };
 
         this.router = new Router(this.modules);

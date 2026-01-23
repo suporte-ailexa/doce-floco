@@ -72,12 +72,27 @@ class AIService {
     _buildSystemPrompt({ clientName, history, chatRecent, menuJson, todayDate, dayName, forcedContext, lastAddress, activeOrder }) {
         const { 
             storeName, deliveryFee, address,
-            acaiSizes, freeAddons, paidAddons,     
+            acaiSizes, freeAddons, paidAddons,
+            minDeliveryQty     
         } = this.config;
 
         const knownAddressInfo = lastAddress ? `Endereço Conhecido: "${lastAddress}".` : "Endereço: Não informado.";
         const hasAcaiMenu = acaiSizes && acaiSizes.trim().length > 0;
         
+        // 2. Criar a string da regra de quantidade
+        let deliveryRuleText = `Taxa R$ ${parseFloat(deliveryFee || 0).toFixed(2)}. Endereço obrigatório.`;
+
+        if (minDeliveryQty && parseInt(minDeliveryQty) > 0) {
+        deliveryRuleText += `
+        ⚠️ REGRA DE PEDIDO MÍNIMO (CRÍTICO):
+        - Para ENTREGA: O pedido DEVE ter no mínimo ${minDeliveryQty} itens (picolés/copos).
+        - Se o cliente pedir menos de ${minDeliveryQty} itens para entrega, RECUSE GENTILMENTE.
+        - Exemplo de recusa: "Para entrega, nosso pedido mínimo é de ${minDeliveryQty} unidades. Quer completar com mais alguns?"
+        - Para RETIRADA (Balcão): NÃO existe quantidade mínima. Pode liberar qualquer quantidade.
+        - NÃO gere o JSON "create_order" se for Entrega e a quantidade for menor que ${minDeliveryQty}.
+        `;
+        }
+
         // --- ALTERAÇÃO AQUI: Lógica de Açaí ---
         let acaiSection = "";
         let acaiSilentRule = "";
@@ -99,7 +114,6 @@ class AIService {
             - Se o cliente pedir o cardápio ou disser "Oi", ofereça apenas os picolés/sorvetes da vitrine.
             `;
         }
-        // --------------------------------------
 
         // Lógica Anti-Duplicidade
         let activeOrderSection = "";
@@ -143,12 +157,12 @@ class AIService {
 
         === REGRAS GERAIS ===
         - Retirada: Grátis.
-        - Entrega: Taxa R$ ${parseFloat(deliveryFee || 0).toFixed(2)}. Endereço obrigatório.
+        - Entrega: ${deliveryRuleText} 
         ${acaiSilentRule}
 
         === COMANDOS JSON ===
         
-        A) CRIAR NOVO PEDIDO (Só se não houver pendente):
+        A) CRIAR NOVO PEDIDO (Só se não houver pendente E respeitar o mínimo de entrega):
         ###JSON### {"type": "create_order", "items": "...", "total": 0.00, "method": "Entrega", "payment": "Pix", "address": "..."} ###ENDJSON###
         
         B) ATUALIZAR PEDIDO EXISTENTE (Se houver pendente):
@@ -159,6 +173,8 @@ class AIService {
         Chat Atual:
         ${chatRecent}
         `;
+
+
     }
 
     _parseResponse(aiResponseText) {

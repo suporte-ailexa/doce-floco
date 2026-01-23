@@ -1,6 +1,7 @@
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const EventEmitter = require('events');
 const fs = require('fs');
+const path = require('path');
 
 class WhatsappService extends EventEmitter {
     constructor(sessionPath, chromePath, isDev) {
@@ -17,28 +18,48 @@ class WhatsappService extends EventEmitter {
         if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
         
         if (this.client) {
-            this.client.destroy().catch(() => {});
+            try { this.client.destroy(); } catch(e){}
             this.client = null;
         }
 
-        console.log('[WhatsApp] Inicializando cliente...');
+        console.log('[WhatsApp] Inicializando com FIX de VERSÕES: w-w.js@1.19.5 + puppeteer@13.0.0 + Web@2.2307.7 (DEBUG)...');
 
         this.client = new Client({
             authStrategy: new LocalAuth({ 
                 clientId: 'doce-floco-session', 
                 dataPath: this.sessionPath 
             }),
+            // --- FIX CRÍTICO: FORÇAR VERSÃO ESTÁVEL DO WHATSAPP WEB ---
+            // Esta versão (2.2307.7) é mais compatível com puppeteer v13 e w-w.js v1.19.5
+            //webVersionCache: {
+            //    type: 'remote',
+            //    remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2307.7.html',
+            //},
+            // --- Mantenha autoMarkRead: false ---
+            autoMarkRead: false,
+            // ------------------------------------
             puppeteer: {
-                headless: true,
-                executablePath: this.chromePath,
-                args: ['--no-sandbox', '--disable-setuid-sandbox']
+                headless: false, // Mantenha false para observar o que acontece
+                executablePath: this.chromePath, // Usará o Chromium compatível com Puppeteer 13.0.0
+                args: [
+                    '--no-sandbox', 
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-accelerated-2d-canvas',
+                    '--no-first-run',
+                    '--no-zygote',
+                    '--disable-gpu',
+                    '--window-size=1280,800', 
+                    '--disable-web-security',
+                    '--disable-features=IsolateOrigins,site-per-process'
+                ]
             }
         });
 
         this._setupListeners();
         
         this.client.initialize().catch(err => {
-            console.error('[WhatsApp] Falha na inicialização:', err.message);
+            console.error('[WhatsApp] Falha crítica na inicialização:', err.message);
             this.emit('status', 'erro_inicializacao');
             this._scheduleReconnect();
         });
@@ -46,6 +67,7 @@ class WhatsappService extends EventEmitter {
 
     _setupListeners() {
         this.client.on('qr', (qr) => {
+            console.log('[WhatsApp] QR Code gerado.');
             this.status = 'aguardando_scan';
             this.emit('qr', qr);
             this.emit('status', this.status);
@@ -56,7 +78,14 @@ class WhatsappService extends EventEmitter {
             this.status = 'conectado';
             this.emit('ready');
             this.emit('status', this.status);
-            this.emit('qr', '');
+            this.emit('qr', ''); 
+        });
+
+        this.client.on('auth_failure', (msg) => {
+            console.error('[WhatsApp] Falha de autenticação:', msg);
+            this.status = 'desconectado';
+            this.emit('status', 'erro_autenticacao');
+            this._scheduleReconnect();
         });
 
         this.client.on('disconnected', (reason) => {
@@ -75,77 +104,62 @@ class WhatsappService extends EventEmitter {
     _scheduleReconnect() {
         if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
         this.reconnectTimer = setTimeout(() => {
-            console.log('[WhatsApp] Tentando reconectar...');
+            console.log('[WhatsApp] Tentando reconectar automaticamente...');
             this.initialize();
-        }, 10000);
+        }, 15000);
     }
 
     async logout() {
         if (this.client) {
-            await this.client.logout();
-            await this.client.destroy();
+            try { await this.client.logout(); } catch(e){ console.warn('[WhatsApp] Erro ao fazer logout:', e.message); }
+            try { await this.client.destroy(); } catch(e){ console.warn('[WhatsApp] Erro ao destruir cliente:', e.message); }
             this.client = null;
             this.status = 'desconectado';
             this.emit('status', this.status);
+            if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
         }
-    }
-
-    /**
-     * Lógica INTELIGENTE de ID.
-     * Resolve o problema de mensagens não chegando.
-     */
-    async _getSmartId(rawNumber) {
-        if (!this.client) return null;
-
-        // 1. Limpeza brutal: Apenas números
-        let clean = rawNumber.toString().replace(/\D/g, '');
-
-        // 2. Heurística Brasil: Se tem 10 ou 11 dígitos, provavelmente falta o 55
-        if ((clean.length === 10 || clean.length === 11) && !clean.startsWith('55')) {
-            clean = '55' + clean;
-        }
-
-        // 3. Consulta o WhatsApp (A MÁGICA ACONTECE AQUI)
-        try {
-            // O getNumberId verifica se o número existe e devolve o formato interno correto (_serialized)
-            const contactId = await this.client.getNumberId(clean);
-            if (contactId && contactId._serialized) {
-                return contactId._serialized;
-            }
-        } catch (e) {
-            console.warn(`[WhatsApp] Falha ao verificar número ${clean}:`, e.message);
-        }
-
-        // 4. Fallback: Se a verificação falhar (ex: internet lenta), tenta o formato padrão
-        return clean.includes('@c.us') ? clean : `${clean}@c.us`;
     }
 
     async sendText(to, text) {
-        if (this.status !== 'conectado') return false;
+        if (this.status !== 'conectado' || !this.client) {
+            console.warn('[WhatsApp] Não conectado ou cliente indisponível para enviar texto.');
+            return false;
+        }
         try {
-            // Usa o ID verificado em vez do ID cru
-            const finalId = await this._getSmartId(to);
-            if (!finalId) throw new Error("ID inválido");
+            let clean = to.toString().replace(/\D/g, '');
+            if ((clean.length === 10 || clean.length === 11) && !clean.startsWith('55')) clean = '55' + clean;
+            const finalId = clean.includes('@c.us') ? clean : `${clean}@c.us`;
 
+            console.log(`[WhatsApp-DEBUG] Tentando enviar mensagem. ID: ${finalId}, Texto: "${text.substring(0, 50)}..."`);
+            
             await this.client.sendMessage(finalId, text);
+            console.log(`[WhatsApp-DEBUG] Mensagem enviada com sucesso para ${finalId}.`);
             return true;
         } catch (error) {
-            console.error(`[WhatsApp] Erro envio para ${to}:`, error.message);
+            console.error(`[WhatsApp] Erro envio texto para ${to}:`, error.message);
+            if (error.message.includes('markedUnread') || error.message.includes('multiple-uim-roots')) {
+                console.error(`[WhatsApp-DEBUG] ERRO CRÍTICO de COMPATIBILIDADE. O WhatsApp Web (versão ${this.client.info ? this.client.info.webVersion : 'desconhecida'}) pode estar incompatível com o w-w.js ${require('whatsapp-web.js/package.json').version}.`);
+            }
             return false;
         }
     }
 
     async sendImage(to, filePath, caption = "") {
-        if (this.status !== 'conectado') return false;
+        if (this.status !== 'conectado' || !this.client) {
+            console.warn('[WhatsApp] Não conectado ou cliente indisponível para enviar imagem.');
+            return false;
+        }
         try {
-            const finalId = await this._getSmartId(to); // Usa a mesma validação
-            if (!finalId) throw new Error("ID inválido");
+            let clean = to.toString().replace(/\D/g, '');
+            if ((clean.length === 10 || clean.length === 11) && !clean.startsWith('55')) clean = '55' + clean;
+            const finalId = clean.includes('@c.us') ? clean : `${clean}@c.us`;
 
             if (fs.existsSync(filePath)) {
                 const media = MessageMedia.fromFilePath(filePath);
                 await this.client.sendMessage(finalId, media, { caption });
                 return true;
             }
+            console.warn(`[WhatsApp] Imagem não encontrada ou inválida: ${filePath}`);
             return false;
         } catch (error) {
             console.error('[WhatsApp] Erro envio imagem:', error.message);

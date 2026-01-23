@@ -26,6 +26,12 @@ class AppController {
         this.wa = new WhatsappService(sessionPath, chromePath, isDev);
         this.messageBuffers = new Map();
         this.workerWindow = null; 
+
+        // NOVAS PROPRIEDADES PARA O DISPARO EM MASSA
+        this.isMassSendingActive = false;
+        this.stopMassSendingFlag = false;
+        // Tempo de atraso entre mensagens (em milissegundos) para evitar banimento
+        this.MASS_SEND_DELAY_MS = 4000; // 4 segundos de atraso
     }
 
     async initialize() {
@@ -220,6 +226,32 @@ class AppController {
                         // TENTA IDENTIFICAR PRODUTOS PARA BAIXA DE ESTOQUE
                         const computedCart = this._matchProductsFromText(cmd.items, allProducts);
 
+                        // --- INÍCIO DA VALIDAÇÃO DE MÍNIMO ---
+                        const conf = await this.db.getStoreConfig();
+                        const minQty = parseInt(conf.minDeliveryQty || 0);
+                        const isDelivery = (cmd.method || '').toLowerCase().includes('entrega');
+
+                        // Calcula quantidade total baseada no parser
+                        let totalCount = 0;
+                        if (computedCart.length > 0) {
+                            totalCount = computedCart.reduce((sum, item) => sum + item.qty, 0);
+                        } else {
+                            // Fallback: se o parser falhou (ex: texto livre), tenta estimar via regex simples
+                            // ou confia na IA (arriscado), aqui vamos assumir 1 se não achou nada, 
+                            // mas o ideal é o parser funcionar.
+                            totalCount = 1; 
+                        }
+
+                        if (isDelivery && minQty > 0 && totalCount < minQty) {
+                            console.log(`[Regra Negócio] Pedido recusado. Qtd: ${totalCount}, Mínimo: ${minQty}`);
+                            // Não cria o pedido. Responde ao cliente explicando.
+                            finalReply = `⚠️ Ops! A IA se confundiu. Para entrega, o pedido mínimo é de *${minQty} unidades*. Você pediu apenas ${totalCount}. Gostaria de adicionar mais itens ou mudar para retirada?`;
+                            await this.wa.sendText(chatId, finalReply);
+                            await this.db.logMessage(client.id, { chatId, fromMe: true, body: finalReply, isAutoReply: true });
+                            return; // INTERROMPE A CRIAÇÃO DO PEDIDO
+                        }
+                        // --- FIM DA VALIDAÇÃO ---
+
                         result = await this.db.createStandardOrder({ 
                             ...cmd, 
                             clientId: client.id, 
@@ -314,19 +346,38 @@ class AppController {
             }
 
             if (finalReply.trim()) {
-                await this.wa.sendText(chatId, finalReply);
-                await this.db.logMessage(client.id, { chatId, fromMe: true, body: finalReply, isAutoReply: true });
+                // Adiciona um pequeno atraso antes de tentar enviar a mensagem principal
+                // Isso dá tempo ao whatsapp-web.js para se estabilizar
+                await new Promise(resolve => setTimeout(resolve, 500)); // Espera 500ms
+
+                const sent = await this.wa.sendText(chatId, finalReply);
+                if (sent) {
+                    await this.db.logMessage(client.id, { chatId, fromMe: true, body: finalReply, isAutoReply: true });
+                } else {
+                    console.error('[Controller] Falha ao enviar resposta da IA após atraso.');
+                    // Tenta novamente com um delay maior se falhou, como último recurso.
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                    const retrySent = await this.wa.sendText(chatId, finalReply);
+                    if (retrySent) {
+                         await this.db.logMessage(client.id, { chatId, fromMe: true, body: finalReply, isAutoReply: true });
+                    } else {
+                        console.error('[Controller] Falha persistente ao enviar resposta da IA.');
+                    }
+                }
             }
 
+            // Os setTimeout para specialActions já têm atraso, mas vamos ajustá-los um pouco também
             if (response.specialActions) {
                 if (response.specialActions.sendAcaiMenu) {
                     const config = await this.db.getStoreConfig();
                     if (config.imgAcaiPath) {
-                        setTimeout(() => this.wa.sendImage(chatId, config.imgAcaiPath, "💜 Tabela de Açaí"), 1500);
+                        // Aumenta o atraso para ter certeza que a mensagem principal já foi
+                        setTimeout(() => this.wa.sendImage(chatId, config.imgAcaiPath, "💜 Tabela de Açaí"), 2500); 
                     }
                 }
                 if (response.specialActions.sendVitrine) {
-                    setTimeout(() => this._sendDailyShowcase(chatId), 2000); 
+                    // Aumenta o atraso
+                    setTimeout(() => this._sendDailyShowcase(chatId), 3000); 
                 }
             }
 
@@ -505,6 +556,149 @@ class AppController {
         ipcMain.handle('print-close-register', async (e, summaryData) => {
              return await this._printCloseRegister(summaryData);
         });
+
+        // NOVOS HANDLERS IPC PARA DISPARO EM MASSA
+        ipcMain.handle('start-mass-send', async (e, message, recipients) => {
+            if (this.isMassSendingActive) {
+                this.mainWindow.webContents.send('mass-send-status', {
+                    isFinished: true, sentCount: 0, failedCount: 0, totalClients: 0,
+                    lastMessage: { text: 'Um disparo em massa já está em andamento.', type: 'warning' }
+                });
+                return { success: false, error: 'Mass sending already active.' };
+            }
+            this.isMassSendingActive = true;
+            this.stopMassSendingFlag = false; // Reset da flag
+            this._runMassSending(message, recipients);
+            return { success: true };
+        });
+
+        ipcMain.handle('stop-mass-send', () => {
+            this.stopMassSendingFlag = true; // Define a flag para parar o loop
+            console.log('[Mass Send] Solicitação de interrupção recebida.');
+            return { success: true };
+        });
+    }
+
+    /**
+     * Lógica principal para o disparo em massa.
+     * Agora aceita um objeto 'recipients' que pode conter clientIds ou spreadsheetData.
+     */
+    async _runMassSending(messageTemplate, recipients) {
+        let sentCount = 0;
+        let failedCount = 0;
+        let contactsToSend = [];
+
+        // Avisa a UI que o processo começou
+        this.mainWindow.webContents.send('mass-send-status', {
+            isFinished: false, sentCount: 0, failedCount: 0, totalClients: 0,
+            lastMessage: { text: 'Preparando lista de contatos...', type: 'info' }
+        });
+
+        try {
+            if (this.wa.status !== 'conectado') {
+                throw new Error('O WhatsApp não está conectado. Conecte-o primeiro na aba "Conexão".');
+            }
+
+            // 1. Determinar a lista de contatos a enviar
+            if (recipients && recipients.clientIds && recipients.clientIds.length > 0) {
+                // Se são IDs de clientes do DB
+                contactsToSend = await this.db.getClientsByIds(recipients.clientIds);
+                if (contactsToSend.length === 0) {
+                     throw new Error('Nenhum cliente cadastrado válido encontrado com os IDs selecionados.');
+                }
+            } else if (recipients && recipients.spreadsheetData && recipients.spreadsheetData.length > 0) {
+                // Se são dados de planilha (já vem com name e phone)
+                contactsToSend = recipients.spreadsheetData;
+            } else {
+                throw new Error('Nenhum contato válido fornecido para o disparo em massa.');
+            }
+
+            const totalClients = contactsToSend.length;
+
+            if (totalClients === 0) {
+                this.mainWindow.webContents.send('mass-send-status', {
+                    isFinished: true, sentCount: 0, failedCount: 0, totalClients: 0,
+                    lastMessage: { text: 'Nenhum contato elegível encontrado para o disparo.', type: 'info' }
+                });
+                return;
+            }
+
+            this.mainWindow.webContents.send('mass-send-status', {
+                isFinished: false, sentCount: 0, failedCount: 0, totalClients,
+                lastMessage: { text: `Iniciando envio para ${totalClients} contatos...`, type: 'info' }
+            });
+
+            for (const contact of contactsToSend) {
+                if (this.stopMassSendingFlag) {
+                    console.log('[Mass Send] Interrompendo disparo em massa a pedido do usuário.');
+                    this.mainWindow.webContents.send('mass-send-status', {
+                        isFinished: true, isStopped: true, sentCount, failedCount, totalClients,
+                        lastMessage: { text: `Disparo interrompido. ${sentCount} enviados, ${failedCount} falhas.`, type: 'warning' }
+                    });
+                    return; // Sai do loop e da função
+                }
+
+                const clientName = contact.name || 'Cliente';
+                const personalizedMessage = messageTemplate.replace(/%NOME_CLIENTE%/g, clientName);
+                const rawPhone = contact.phone.replace(/\D/g, ''); // Garante que o telefone esteja limpo
+                const fullPhone = rawPhone.includes('@c.us') ? rawPhone : `${rawPhone}@c.us`;
+
+                let success = false;
+                try {
+                    console.log(`[Mass Send] Enviando para ${clientName} (${rawPhone})...`);
+                    success = await this.wa.sendText(fullPhone, personalizedMessage);
+                    
+                    if (success) {
+                        sentCount++;
+                        // Se for um cliente do DB, loga no histórico. Se for da planilha, não há clientId para logar facilmente.
+                        // Poderíamos criar um cliente "temporário" ou um log global para planilhas.
+                        // Por simplicidade, só logamos se houver um `contact.id` (indicando ser do DB).
+                        if (contact.id) {
+                            await this.db.logMessage(contact.id, { 
+                                chatId: fullPhone, fromMe: true, body: personalizedMessage, 
+                                content: personalizedMessage, isAutomated: true, read: true 
+                            });
+                        }
+                        this.mainWindow.webContents.send('mass-send-status', {
+                            isFinished: false, sentCount, failedCount, totalClients,
+                            lastMessage: { text: `Enviado para ${clientName}.`, type: 'success' }
+                        });
+                    } else {
+                        failedCount++;
+                        this.mainWindow.webContents.send('mass-send-status', {
+                            isFinished: false, sentCount, failedCount, totalClients,
+                            lastMessage: { text: `Falha ao enviar para ${clientName}.`, type: 'error' }
+                        });
+                    }
+                } catch (error) {
+                    console.error(`[Mass Send] Erro ao enviar para ${clientName}:`, error);
+                    failedCount++;
+                    this.mainWindow.webContents.send('mass-send-status', {
+                        isFinished: false, sentCount, failedCount, totalClients,
+                        lastMessage: { text: `Erro crítico para ${clientName}: ${error.message.substring(0, 50)}...`, type: 'error' }
+                    });
+                }
+
+                // Atraso entre as mensagens para evitar bloqueio
+                await new Promise(resolve => setTimeout(resolve, this.MASS_SEND_DELAY_MS));
+            }
+
+            // Finaliza o processo
+            this.mainWindow.webContents.send('mass-send-status', {
+                isFinished: true, sentCount, failedCount, totalClients,
+                lastMessage: { text: `Disparo em massa concluído! ${sentCount} enviados, ${failedCount} falhas.`, type: (failedCount === 0 ? 'success' : 'warning') }
+            });
+
+        } catch (error) {
+            console.error('[Mass Send] Erro no disparo em massa:', error);
+            this.mainWindow.webContents.send('mass-send-status', {
+                isFinished: true, sentCount, failedCount, totalClients: contactsToSend.length,
+                lastMessage: { text: `Erro geral no disparo: ${error.message}`, type: 'error' }
+            });
+        } finally {
+            this.isMassSendingActive = false;
+            this.stopMassSendingFlag = false;
+        }
     }
 
     async _printCloseRegister(data) {

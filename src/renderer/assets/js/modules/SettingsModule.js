@@ -205,6 +205,7 @@ export class SettingsModule {
 
             // Step 2: Regras & Açaí
             $('cfgDeliveryFee').value = d.deliveryFee || '';
+            $('cfgMinDeliveryQty').value = d.minDeliveryQty || 0;
             
             if (d.imgAcaiPath) show($('statusImgAcai'));
 
@@ -393,6 +394,7 @@ export class SettingsModule {
                 welcomeMsg: $('cfgWelcomeMsg').value,
                 useEmojis: $('cfgUseEmojis').checked,
                 deliveryFee: parseFloat($('cfgDeliveryFee').value) || 0,
+                minDeliveryQty: parseInt($('cfgMinDeliveryQty').value) || 0,
                 acaiSizes: Array.from(this.chips.acaiSizes).join(', '),
                 freeAddons: Array.from(this.chips.freeAddons).join(', '),
                 paidAddons: Array.from(this.chips.paidAddons).join(', '),

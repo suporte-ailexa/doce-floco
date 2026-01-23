@@ -1,5 +1,5 @@
 CONTEXTO DO PROJETO (CÓDIGO FONTE)
-Data da geração: 14/01/2026, 04:47:25
+Data da geração: 21/01/2026, 20:33:35
 
 ================================================================================
 ARQUIVO: /package.json
@@ -34,7 +34,7 @@ ARQUIVO: /package.json
     "electron": "^28.2.3",
     "electron-builder": "^24.9.1",
     "postcss": "^8.4.35",
-    "puppeteer": "^24.34.0",
+    "puppeteer": "13.0.0",
     "tailwindcss": "^3.4.1"
   },
   "dependencies": {
@@ -46,7 +46,7 @@ ARQUIVO: /package.json
     "luxon": "^3.7.2",
     "node-cron": "^4.2.1",
     "qrcode-terminal": "^0.12.0",
-    "whatsapp-web.js": "^1.34.4"
+    "whatsapp-web.js": "1.19.5"
   },
   "build": {
     "appId": "com.docefloco.app",
@@ -323,6 +323,32 @@ class AppController {
                         // TENTA IDENTIFICAR PRODUTOS PARA BAIXA DE ESTOQUE
                         const computedCart = this._matchProductsFromText(cmd.items, allProducts);
 
+                        // --- INÍCIO DA VALIDAÇÃO DE MÍNIMO ---
+                        const conf = await this.db.getStoreConfig();
+                        const minQty = parseInt(conf.minDeliveryQty || 0);
+                        const isDelivery = (cmd.method || '').toLowerCase().includes('entrega');
+
+                        // Calcula quantidade total baseada no parser
+                        let totalCount = 0;
+                        if (computedCart.length > 0) {
+                            totalCount = computedCart.reduce((sum, item) => sum + item.qty, 0);
+                        } else {
+                            // Fallback: se o parser falhou (ex: texto livre), tenta estimar via regex simples
+                            // ou confia na IA (arriscado), aqui vamos assumir 1 se não achou nada, 
+                            // mas o ideal é o parser funcionar.
+                            totalCount = 1; 
+                        }
+
+                        if (isDelivery && minQty > 0 && totalCount < minQty) {
+                            console.log(`[Regra Negócio] Pedido recusado. Qtd: ${totalCount}, Mínimo: ${minQty}`);
+                            // Não cria o pedido. Responde ao cliente explicando.
+                            finalReply = `⚠️ Ops! A IA se confundiu. Para entrega, o pedido mínimo é de *${minQty} unidades*. Você pediu apenas ${totalCount}. Gostaria de adicionar mais itens ou mudar para retirada?`;
+                            await this.wa.sendText(chatId, finalReply);
+                            await this.db.logMessage(client.id, { chatId, fromMe: true, body: finalReply, isAutoReply: true });
+                            return; // INTERROMPE A CRIAÇÃO DO PEDIDO
+                        }
+                        // --- FIM DA VALIDAÇÃO ---
+
                         result = await this.db.createStandardOrder({ 
                             ...cmd, 
                             clientId: client.id, 
@@ -417,19 +443,38 @@ class AppController {
             }
 
             if (finalReply.trim()) {
-                await this.wa.sendText(chatId, finalReply);
-                await this.db.logMessage(client.id, { chatId, fromMe: true, body: finalReply, isAutoReply: true });
+                // Adiciona um pequeno atraso antes de tentar enviar a mensagem principal
+                // Isso dá tempo ao whatsapp-web.js para se estabilizar
+                await new Promise(resolve => setTimeout(resolve, 500)); // Espera 500ms
+
+                const sent = await this.wa.sendText(chatId, finalReply);
+                if (sent) {
+                    await this.db.logMessage(client.id, { chatId, fromMe: true, body: finalReply, isAutoReply: true });
+                } else {
+                    console.error('[Controller] Falha ao enviar resposta da IA após atraso.');
+                    // Tenta novamente com um delay maior se falhou, como último recurso.
+                    await new Promise(resolve => setTimeout(resolve, 2000));
+                    const retrySent = await this.wa.sendText(chatId, finalReply);
+                    if (retrySent) {
+                         await this.db.logMessage(client.id, { chatId, fromMe: true, body: finalReply, isAutoReply: true });
+                    } else {
+                        console.error('[Controller] Falha persistente ao enviar resposta da IA.');
+                    }
+                }
             }
 
+            // Os setTimeout para specialActions já têm atraso, mas vamos ajustá-los um pouco também
             if (response.specialActions) {
                 if (response.specialActions.sendAcaiMenu) {
                     const config = await this.db.getStoreConfig();
                     if (config.imgAcaiPath) {
-                        setTimeout(() => this.wa.sendImage(chatId, config.imgAcaiPath, "💜 Tabela de Açaí"), 1500);
+                        // Aumenta o atraso para ter certeza que a mensagem principal já foi
+                        setTimeout(() => this.wa.sendImage(chatId, config.imgAcaiPath, "💜 Tabela de Açaí"), 2500); 
                     }
                 }
                 if (response.specialActions.sendVitrine) {
-                    setTimeout(() => this._sendDailyShowcase(chatId), 2000); 
+                    // Aumenta o atraso
+                    setTimeout(() => this._sendDailyShowcase(chatId), 3000); 
                 }
             }
 
@@ -1037,12 +1082,27 @@ class AIService {
     _buildSystemPrompt({ clientName, history, chatRecent, menuJson, todayDate, dayName, forcedContext, lastAddress, activeOrder }) {
         const { 
             storeName, deliveryFee, address,
-            acaiSizes, freeAddons, paidAddons,     
+            acaiSizes, freeAddons, paidAddons,
+            minDeliveryQty     
         } = this.config;
 
         const knownAddressInfo = lastAddress ? `Endereço Conhecido: "${lastAddress}".` : "Endereço: Não informado.";
         const hasAcaiMenu = acaiSizes && acaiSizes.trim().length > 0;
         
+        // 2. Criar a string da regra de quantidade
+        let deliveryRuleText = `Taxa R$ ${parseFloat(deliveryFee || 0).toFixed(2)}. Endereço obrigatório.`;
+
+        if (minDeliveryQty && parseInt(minDeliveryQty) > 0) {
+        deliveryRuleText += `
+        ⚠️ REGRA DE PEDIDO MÍNIMO (CRÍTICO):
+        - Para ENTREGA: O pedido DEVE ter no mínimo ${minDeliveryQty} itens (picolés/copos).
+        - Se o cliente pedir menos de ${minDeliveryQty} itens para entrega, RECUSE GENTILMENTE.
+        - Exemplo de recusa: "Para entrega, nosso pedido mínimo é de ${minDeliveryQty} unidades. Quer completar com mais alguns?"
+        - Para RETIRADA (Balcão): NÃO existe quantidade mínima. Pode liberar qualquer quantidade.
+        - NÃO gere o JSON "create_order" se for Entrega e a quantidade for menor que ${minDeliveryQty}.
+        `;
+        }
+
         // --- ALTERAÇÃO AQUI: Lógica de Açaí ---
         let acaiSection = "";
         let acaiSilentRule = "";
@@ -1064,7 +1124,6 @@ class AIService {
             - Se o cliente pedir o cardápio ou disser "Oi", ofereça apenas os picolés/sorvetes da vitrine.
             `;
         }
-        // --------------------------------------
 
         // Lógica Anti-Duplicidade
         let activeOrderSection = "";
@@ -1108,12 +1167,12 @@ class AIService {
 
         === REGRAS GERAIS ===
         - Retirada: Grátis.
-        - Entrega: Taxa R$ ${parseFloat(deliveryFee || 0).toFixed(2)}. Endereço obrigatório.
+        - Entrega: ${deliveryRuleText} 
         ${acaiSilentRule}
 
         === COMANDOS JSON ===
         
-        A) CRIAR NOVO PEDIDO (Só se não houver pendente):
+        A) CRIAR NOVO PEDIDO (Só se não houver pendente E respeitar o mínimo de entrega):
         ###JSON### {"type": "create_order", "items": "...", "total": 0.00, "method": "Entrega", "payment": "Pix", "address": "..."} ###ENDJSON###
         
         B) ATUALIZAR PEDIDO EXISTENTE (Se houver pendente):
@@ -1124,6 +1183,8 @@ class AIService {
         Chat Atual:
         ${chatRecent}
         `;
+
+
     }
 
     _parseResponse(aiResponseText) {
@@ -1527,6 +1588,7 @@ ARQUIVO: /src/main/services/WhatsappService.js
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const EventEmitter = require('events');
 const fs = require('fs');
+const path = require('path');
 
 class WhatsappService extends EventEmitter {
     constructor(sessionPath, chromePath, isDev) {
@@ -1543,28 +1605,48 @@ class WhatsappService extends EventEmitter {
         if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
         
         if (this.client) {
-            this.client.destroy().catch(() => {});
+            try { this.client.destroy(); } catch(e){}
             this.client = null;
         }
 
-        console.log('[WhatsApp] Inicializando cliente...');
+        console.log('[WhatsApp] Inicializando com FIX de VERSÕES: w-w.js@1.19.5 + puppeteer@13.0.0 + Web@2.2307.7 (DEBUG)...');
 
         this.client = new Client({
             authStrategy: new LocalAuth({ 
                 clientId: 'doce-floco-session', 
                 dataPath: this.sessionPath 
             }),
+            // --- FIX CRÍTICO: FORÇAR VERSÃO ESTÁVEL DO WHATSAPP WEB ---
+            // Esta versão (2.2307.7) é mais compatível com puppeteer v13 e w-w.js v1.19.5
+            webVersionCache: {
+                type: 'remote',
+                remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2307.7.html',
+            },
+            // --- Mantenha autoMarkRead: false ---
+            autoMarkRead: false,
+            // ------------------------------------
             puppeteer: {
-                headless: true,
-                executablePath: this.chromePath,
-                args: ['--no-sandbox', '--disable-setuid-sandbox']
+                headless: false, // Mantenha false para observar o que acontece
+                executablePath: this.chromePath, // Usará o Chromium compatível com Puppeteer 13.0.0
+                args: [
+                    '--no-sandbox', 
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-accelerated-2d-canvas',
+                    '--no-first-run',
+                    '--no-zygote',
+                    '--disable-gpu',
+                    '--window-size=1280,800', 
+                    '--disable-web-security',
+                    '--disable-features=IsolateOrigins,site-per-process'
+                ]
             }
         });
 
         this._setupListeners();
         
         this.client.initialize().catch(err => {
-            console.error('[WhatsApp] Falha na inicialização:', err.message);
+            console.error('[WhatsApp] Falha crítica na inicialização:', err.message);
             this.emit('status', 'erro_inicializacao');
             this._scheduleReconnect();
         });
@@ -1572,6 +1654,7 @@ class WhatsappService extends EventEmitter {
 
     _setupListeners() {
         this.client.on('qr', (qr) => {
+            console.log('[WhatsApp] QR Code gerado.');
             this.status = 'aguardando_scan';
             this.emit('qr', qr);
             this.emit('status', this.status);
@@ -1582,7 +1665,14 @@ class WhatsappService extends EventEmitter {
             this.status = 'conectado';
             this.emit('ready');
             this.emit('status', this.status);
-            this.emit('qr', '');
+            this.emit('qr', ''); 
+        });
+
+        this.client.on('auth_failure', (msg) => {
+            console.error('[WhatsApp] Falha de autenticação:', msg);
+            this.status = 'desconectado';
+            this.emit('status', 'erro_autenticacao');
+            this._scheduleReconnect();
         });
 
         this.client.on('disconnected', (reason) => {
@@ -1601,77 +1691,62 @@ class WhatsappService extends EventEmitter {
     _scheduleReconnect() {
         if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
         this.reconnectTimer = setTimeout(() => {
-            console.log('[WhatsApp] Tentando reconectar...');
+            console.log('[WhatsApp] Tentando reconectar automaticamente...');
             this.initialize();
-        }, 10000);
+        }, 15000);
     }
 
     async logout() {
         if (this.client) {
-            await this.client.logout();
-            await this.client.destroy();
+            try { await this.client.logout(); } catch(e){ console.warn('[WhatsApp] Erro ao fazer logout:', e.message); }
+            try { await this.client.destroy(); } catch(e){ console.warn('[WhatsApp] Erro ao destruir cliente:', e.message); }
             this.client = null;
             this.status = 'desconectado';
             this.emit('status', this.status);
+            if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
         }
-    }
-
-    /**
-     * Lógica INTELIGENTE de ID.
-     * Resolve o problema de mensagens não chegando.
-     */
-    async _getSmartId(rawNumber) {
-        if (!this.client) return null;
-
-        // 1. Limpeza brutal: Apenas números
-        let clean = rawNumber.toString().replace(/\D/g, '');
-
-        // 2. Heurística Brasil: Se tem 10 ou 11 dígitos, provavelmente falta o 55
-        if ((clean.length === 10 || clean.length === 11) && !clean.startsWith('55')) {
-            clean = '55' + clean;
-        }
-
-        // 3. Consulta o WhatsApp (A MÁGICA ACONTECE AQUI)
-        try {
-            // O getNumberId verifica se o número existe e devolve o formato interno correto (_serialized)
-            const contactId = await this.client.getNumberId(clean);
-            if (contactId && contactId._serialized) {
-                return contactId._serialized;
-            }
-        } catch (e) {
-            console.warn(`[WhatsApp] Falha ao verificar número ${clean}:`, e.message);
-        }
-
-        // 4. Fallback: Se a verificação falhar (ex: internet lenta), tenta o formato padrão
-        return clean.includes('@c.us') ? clean : `${clean}@c.us`;
     }
 
     async sendText(to, text) {
-        if (this.status !== 'conectado') return false;
+        if (this.status !== 'conectado' || !this.client) {
+            console.warn('[WhatsApp] Não conectado ou cliente indisponível para enviar texto.');
+            return false;
+        }
         try {
-            // Usa o ID verificado em vez do ID cru
-            const finalId = await this._getSmartId(to);
-            if (!finalId) throw new Error("ID inválido");
+            let clean = to.toString().replace(/\D/g, '');
+            if ((clean.length === 10 || clean.length === 11) && !clean.startsWith('55')) clean = '55' + clean;
+            const finalId = clean.includes('@c.us') ? clean : `${clean}@c.us`;
 
+            console.log(`[WhatsApp-DEBUG] Tentando enviar mensagem. ID: ${finalId}, Texto: "${text.substring(0, 50)}..."`);
+            
             await this.client.sendMessage(finalId, text);
+            console.log(`[WhatsApp-DEBUG] Mensagem enviada com sucesso para ${finalId}.`);
             return true;
         } catch (error) {
-            console.error(`[WhatsApp] Erro envio para ${to}:`, error.message);
+            console.error(`[WhatsApp] Erro envio texto para ${to}:`, error.message);
+            if (error.message.includes('markedUnread') || error.message.includes('multiple-uim-roots')) {
+                console.error(`[WhatsApp-DEBUG] ERRO CRÍTICO de COMPATIBILIDADE. O WhatsApp Web (versão ${this.client.info ? this.client.info.webVersion : 'desconhecida'}) pode estar incompatível com o w-w.js ${require('whatsapp-web.js/package.json').version}.`);
+            }
             return false;
         }
     }
 
     async sendImage(to, filePath, caption = "") {
-        if (this.status !== 'conectado') return false;
+        if (this.status !== 'conectado' || !this.client) {
+            console.warn('[WhatsApp] Não conectado ou cliente indisponível para enviar imagem.');
+            return false;
+        }
         try {
-            const finalId = await this._getSmartId(to); // Usa a mesma validação
-            if (!finalId) throw new Error("ID inválido");
+            let clean = to.toString().replace(/\D/g, '');
+            if ((clean.length === 10 || clean.length === 11) && !clean.startsWith('55')) clean = '55' + clean;
+            const finalId = clean.includes('@c.us') ? clean : `${clean}@c.us`;
 
             if (fs.existsSync(filePath)) {
                 const media = MessageMedia.fromFilePath(filePath);
                 await this.client.sendMessage(finalId, media, { caption });
                 return true;
             }
+            console.warn(`[WhatsApp] Imagem não encontrada ou inválida: ${filePath}`);
             return false;
         } catch (error) {
             console.error('[WhatsApp] Erro envio imagem:', error.message);
@@ -2665,6 +2740,8 @@ ARQUIVO: /src/renderer/assets/js/modules/DashboardModule.js
 ================================================================================
 import { $, hide, show } from '../utils/DOM.js';
 import { FirebaseService } from '../services/FirebaseService.js';
+// Certifique-se de que luxon está disponível globalmente ou importe-o
+const DateTime = luxon.DateTime;
 
 export class DashboardModule {
     constructor() {
@@ -2673,119 +2750,178 @@ export class DashboardModule {
     }
 
     async init() {
-        console.log('[Dashboard] Iniciando...');
-        this.loadMetrics();
-        this.loadSalesChart();
-        this.updateBotStatus();
+        console.log('[Dashboard] Iniciando com Raio-X do Dia...');
+        
+        // Exibe a data de hoje no título
+        if($('dashTodayDate')) $('dashTodayDate').innerText = DateTime.now().toFormat('dd/MM/yyyy');
 
-        // Listeners dos Cards (Navegação rápida)
-        // Nota: O Router cuida da navegação, aqui apenas disparamos o click nos links da sidebar
-        if($('dashCardOrders')) $('dashCardOrders').onclick = () => $('navPedidos').click();
-        if($('dashCardClients')) $('dashCardClients').onclick = () => $('navClientes').click();
-        if($('dashCardStatus')) $('dashCardStatus').onclick = () => $('navWhatsapp').click();
+        this.loadTodayMetrics();     // NOVA FUNÇÃO
+        this.loadTodaySchedule();    // NOVA FUNÇÃO
+        this.loadSalesChart();       // Mantida (Gráfico 7 dias)
+        
+        // Listener simples para atualizar status do bot (opcional manter)
+        this.updateBotStatus();
     }
 
     destroy() {
-        // Limpeza crítica para liberar memória do Chart.js
         if (this.chartInstance) {
             this.chartInstance.destroy();
             this.chartInstance = null;
         }
     }
 
-    async loadMetrics() {
+    // --- NOVA: Carrega métricas APENAS DE HOJE ---
+    async loadTodayMetrics() {
         try {
-            // Contagem de Clientes
-            const clientsSnap = await this.db.collection('clients').get();
-            if($('dashTotalClients')) $('dashTotalClients').innerText = clientsSnap.size;
+            const todayStart = DateTime.now().startOf('day').toJSDate();
+            const todayEnd = DateTime.now().endOf('day').toJSDate();
 
-            // Contagem de Pedidos Pendentes
-            const ordersSnap = await this.db.collection('orders').where('status', '==', 'Pendente').get();
-            if($('dashOpenOrders')) $('dashOpenOrders').innerText = ordersSnap.size;
+            // 1. Busca pedidos criados HOJE (exclui cancelados se tiver status 'Cancelado')
+            const snapshot = await this.db.collection('orders')
+                .where('createdAt', '>=', todayStart)
+                .where('createdAt', '<=', todayEnd)
+                .get();
+
+            let revenue = 0;
+            let count = 0;
+            let pending = 0;
+
+            snapshot.forEach(doc => {
+                const data = doc.data();
+                
+                // Ignora cancelados
+                if (data.status === 'Cancelado') return;
+                
+                // Soma Pendentes para o card amarelo
+                if (data.status === 'Pendente') pending++;
+
+                // Soma receita
+                revenue += parseFloat(data.total || 0);
+                count++;
+            });
+
+            const avgTicket = count > 0 ? revenue / count : 0;
+
+            // Atualiza UI
+            if($('dashTodayRevenue')) $('dashTodayRevenue').innerText = `R$ ${revenue.toFixed(2)}`;
+            if($('dashTodayCount')) $('dashTodayCount').innerText = count;
+            if($('dashTodayTicket')) $('dashTodayTicket').innerText = `R$ ${avgTicket.toFixed(2)}`;
+            
+            // Atualiza Pendentes (Sobrepõe a lógica antiga para ser mais preciso com o snapshot atual)
+            if($('dashOpenOrders')) $('dashOpenOrders').innerText = pending;
+
         } catch (e) {
-            console.error('[Dashboard] Erro ao carregar métricas:', e);
+            console.error('[Dashboard] Erro métricas hoje:', e);
+        }
+    }
+
+    // --- NOVA: Carrega Encomendas/Festas Agendadas para HOJE ---
+    async loadTodaySchedule() {
+        const container = $('dashTodaySchedule');
+        if(!container) return;
+
+        try {
+            // Data formato string YYYY-MM-DD igual salvo no CalendarModule
+            const todayStr = DateTime.now().toFormat('yyyy-MM-dd');
+
+            const snapshot = await this.db.collection('orders')
+                .where('status', '==', 'Agendado')
+                .where('dueDate', '==', todayStr)
+                .get();
+
+            container.innerHTML = '';
+
+            if (snapshot.empty) {
+                container.innerHTML = '<div class="text-center py-6 text-gray-400 text-xs"><i class="fas fa-mug-hot text-2xl mb-2 opacity-30"></i><br>Nada agendado para hoje.</div>';
+                return;
+            }
+
+            snapshot.forEach(doc => {
+                const d = doc.data();
+                const div = document.createElement('div');
+                // Estilo condicional se for empréstimo
+                const isLoan = !!d.loanedItems;
+                const borderClass = isLoan ? 'border-l-4 border-orange-400' : 'border-l-4 border-purple-400';
+                
+                div.className = `bg-gray-50 p-3 rounded-lg border border-gray-100 ${borderClass} text-xs shadow-sm`;
+                div.innerHTML = `
+                    <div class="flex justify-between font-bold text-gray-700 mb-1">
+                        <span>${d.clientName}</span>
+                        <span>R$ ${parseFloat(d.total).toFixed(2)}</span>
+                    </div>
+                    <div class="text-gray-500 mb-1 truncate">${d.items}</div>
+                    ${isLoan ? `<div class="text-[10px] text-orange-600 font-bold bg-orange-100 px-1 rounded inline-block"><i class="fas fa-box"></i> Empréstimo</div>` : ''}
+                    <div class="mt-1 text-gray-400 text-[10px]"><i class="fas fa-map-marker-alt"></i> ${d.address || 'Retirada'}</div>
+                `;
+                container.appendChild(div);
+            });
+
+        } catch (e) {
+            console.error('[Dashboard] Erro agenda hoje:', e);
         }
     }
 
     async updateBotStatus() {
-        const slot = $('dashNextSlot');
-        if (!slot) return;
-        
+        // ... (Mantenha o código original do updateBotStatus aqui)
         try {
             const status = await window.electronAPI.getWhatsappStatus();
-            slot.innerText = status === 'conectado' ? 'Ativo 🟢' : 'Offline 🔴';
-            slot.className = `text-3xl font-bold ${status === 'conectado' ? 'text-green-600' : 'text-red-600'} mt-1`;
-        } catch (e) {
-            slot.innerText = "Erro";
-        }
+            // Se você quiser mostrar isso no header ou outro lugar
+            console.log('Bot Status:', status); 
+        } catch (e) {}
     }
 
     async loadSalesChart() {
+        // ... (Mantenha o código original do loadSalesChart aqui, ele já funciona bem para os 7 dias)
+        // Apenas garanta que o ID do canvas seja 'salesChart' como no HTML acima
         const ctx = $('salesChart');
         if (!ctx || typeof Chart === 'undefined') return;
-
-        // Se já existe gráfico, destroi antes de recriar
+        
+        // ... (Resto do código do gráfico original) ...
+        // Certifique-se de copiar a lógica do seu arquivo original para cá
         if (this.chartInstance) this.chartInstance.destroy();
-
+        
         try {
             const snapshot = await this.db.collection('orders')
                 .orderBy('createdAt', 'desc')
                 .limit(50)
                 .get();
-
-            if (snapshot.empty) return;
-
-            // Prepara dados dos últimos 7 dias
-            const { DateTime } = luxon;
-            const salesData = {};
-            const today = DateTime.now();
-
-            for (let i = 6; i >= 0; i--) {
+                
+             // ... (Lógica de processamento de dados do gráfico original) ...
+             // Para brevidade, use a lógica que você já tem no arquivo original aqui.
+             const { DateTime } = luxon;
+             const salesData = {};
+             const today = DateTime.now();
+             for (let i = 6; i >= 0; i--) {
                 const d = today.minus({ days: i }).toFormat('dd/MM');
                 salesData[d] = 0;
-            }
-
-            snapshot.forEach(doc => {
+             }
+             
+             snapshot.forEach(doc => {
                 const data = doc.data();
                 if (data.createdAt && (data.total > 0)) {
                     const dateObj = DateTime.fromJSDate(data.createdAt.toDate());
-                    // Filtra apenas se estiver dentro dos últimos 7 dias
                     if (dateObj > today.minus({ days: 7 })) {
                         const key = dateObj.toFormat('dd/MM');
-                        if (salesData[key] !== undefined) {
-                            salesData[key] += parseFloat(data.total);
-                        }
+                        if (salesData[key] !== undefined) salesData[key] += parseFloat(data.total);
                     }
                 }
-            });
+             });
 
-            this.chartInstance = new Chart(ctx, {
-                type: 'bar',
+             this.chartInstance = new Chart(ctx, {
+                type: 'bar', // ou 'line' se preferir
                 data: {
                     labels: Object.keys(salesData),
                     datasets: [{
-                        label: 'Faturamento (R$)',
+                        label: 'Vendas (R$)',
                         data: Object.values(salesData),
-                        backgroundColor: 'rgba(236, 72, 153, 0.6)',
-                        borderColor: 'rgba(236, 72, 153, 1)',
-                        borderWidth: 1,
+                        backgroundColor: '#a78bfa',
                         borderRadius: 4
                     }]
                 },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    plugins: { legend: { display: false } },
-                    scales: {
-                        y: { beginAtZero: true, grid: { color: '#f3f4f6' } },
-                        x: { grid: { display: false } }
-                    }
-                }
-            });
+                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } }
+             });
 
-        } catch (error) {
-            console.error("[Dashboard] Erro no gráfico:", error);
-        }
+        } catch (error) { console.error(error); }
     }
 }
 
@@ -3894,6 +4030,7 @@ export class SettingsModule {
 
             // Step 2: Regras & Açaí
             $('cfgDeliveryFee').value = d.deliveryFee || '';
+            $('cfgMinDeliveryQty').value = d.minDeliveryQty || 0;
             
             if (d.imgAcaiPath) show($('statusImgAcai'));
 
@@ -4082,6 +4219,7 @@ export class SettingsModule {
                 welcomeMsg: $('cfgWelcomeMsg').value,
                 useEmojis: $('cfgUseEmojis').checked,
                 deliveryFee: parseFloat($('cfgDeliveryFee').value) || 0,
+                minDeliveryQty: parseInt($('cfgMinDeliveryQty').value) || 0,
                 acaiSizes: Array.from(this.chips.acaiSizes).join(', '),
                 freeAddons: Array.from(this.chips.freeAddons).join(', '),
                 paidAddons: Array.from(this.chips.paidAddons).join(', '),
@@ -4661,53 +4799,110 @@ ARQUIVO: /src/renderer/index.html
             <!-- Main Scrollable Area -->
             <main class="flex-1 overflow-y-auto p-6 scroll-smooth custom-scrollbar relative">
                 
-                <!-- 1. DASHBOARD -->
+                <!-- 1. DASHBOARD (Raio-X do Dia) -->
                 <section id="sectionDashboard" class="content-section">
-                    <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-                        <!-- Card Pedidos -->
-                        <div id="dashCardOrders" class="bg-white p-6 rounded-2xl shadow-sm border border-purple-100 flex justify-between items-center cursor-pointer hover:shadow-md transition">
+                    
+                    <!-- Cabeçalho do Dia -->
+                    <div class="mb-2 flex items-center gap-2">
+                        <div class="bg-purple-600 text-white w-8 h-8 rounded-lg flex items-center justify-center shadow-sm">
+                            <i class="fas fa-calendar-day"></i>
+                        </div>
+                        <div>
+                            <h3 class="text-sm font-bold text-gray-700 uppercase tracking-wide">Resumo de Hoje</h3>
+                            <p class="text-[10px] text-gray-400 font-mono" id="dashTodayDate">Carregando data...</p>
+                        </div>
+                    </div>
+
+                    <!-- GRID DE CARDS (4 Colunas) -->
+                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                        
+                        <!-- 1. Faturamento Hoje -->
+                        <div class="bg-white p-4 rounded-xl shadow-sm border-l-4 border-emerald-500 flex justify-between items-center transition hover:shadow-md">
                             <div>
-                                <p class="text-xs font-bold text-gray-400 uppercase tracking-wide">Pedidos Abertos</p>
-                                <h3 class="text-3xl font-black text-gray-800 mt-1" id="dashOpenOrders">0</h3>
+                                <p class="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Vendido Hoje</p>
+                                <h3 class="text-2xl font-black text-gray-800 mt-1" id="dashTodayRevenue">R$ 0,00</h3>
                             </div>
-                            <div class="w-12 h-12 bg-purple-50 rounded-xl flex items-center justify-center text-purple-600">
-                                <i class="fas fa-receipt text-xl"></i>
+                            <div class="w-10 h-10 rounded-full bg-emerald-50 flex items-center justify-center text-emerald-600">
+                                <i class="fas fa-dollar-sign text-lg"></i>
                             </div>
                         </div>
 
-                        <!-- Card Clientes -->
-                        <div id="dashCardClients" class="bg-white p-6 rounded-2xl shadow-sm border border-emerald-100 flex justify-between items-center cursor-pointer hover:shadow-md transition">
+                        <!-- 2. Qtd Pedidos Hoje -->
+                        <div class="bg-white p-4 rounded-xl shadow-sm border-l-4 border-blue-500 flex justify-between items-center transition hover:shadow-md">
                             <div>
-                                <p class="text-xs font-bold text-gray-400 uppercase tracking-wide">Clientes Totais</p>
-                                <h3 class="text-3xl font-black text-gray-800 mt-1" id="dashTotalClients">0</h3>
+                                <p class="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Pedidos Hoje</p>
+                                <h3 class="text-2xl font-black text-gray-800 mt-1" id="dashTodayCount">0</h3>
                             </div>
-                            <div class="w-12 h-12 bg-emerald-50 rounded-xl flex items-center justify-center text-emerald-600">
-                                <i class="fas fa-users text-xl"></i>
+                            <div class="w-10 h-10 rounded-full bg-blue-50 flex items-center justify-center text-blue-600">
+                                <i class="fas fa-shopping-bag text-lg"></i>
                             </div>
                         </div>
 
-                        <!-- Card Bot Status (CIANO/GELO) -->
-                        <div id="dashCardStatus" class="bg-white p-6 rounded-2xl shadow-sm border border-cyan-100 flex justify-between items-center cursor-pointer hover:shadow-md transition">
+                        <!-- 3. Ticket Médio Hoje -->
+                        <div class="bg-white p-4 rounded-xl shadow-sm border-l-4 border-purple-500 flex justify-between items-center transition hover:shadow-md">
                             <div>
-                                <p class="text-xs font-bold text-gray-400 uppercase tracking-wide">IA / WhatsApp</p>
-                                <h3 class="text-xl font-bold text-gray-800 mt-2" id="dashNextSlot">Verificando...</h3>
+                                <p class="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Ticket Médio</p>
+                                <h3 class="text-2xl font-black text-gray-800 mt-1" id="dashTodayTicket">R$ 0,00</h3>
                             </div>
-                            <div class="w-12 h-12 bg-cyan-50 rounded-xl flex items-center justify-center text-cyan-600 animate-pulse">
-                                <i class="fas fa-robot text-xl"></i>
+                            <div class="w-10 h-10 rounded-full bg-purple-50 flex items-center justify-center text-purple-600">
+                                <i class="fas fa-chart-line text-lg"></i>
+                            </div>
+                        </div>
+
+                        <!-- 4. Fila / Pendentes (Operacional) -->
+                        <div id="dashCardOrders" class="bg-white p-4 rounded-xl shadow-sm border-l-4 border-yellow-400 flex justify-between items-center cursor-pointer hover:bg-yellow-50 transition" onclick="document.getElementById('navPedidos').click()">
+                            <div>
+                                <p class="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Fila / Pendentes</p>
+                                <h3 class="text-2xl font-black text-yellow-600 mt-1 animate-pulse" id="dashOpenOrders">0</h3>
+                            </div>
+                            <div class="w-10 h-10 rounded-full bg-yellow-100 flex items-center justify-center text-yellow-600">
+                                <i class="fas fa-clock text-lg"></i>
                             </div>
                         </div>
                     </div>
 
-                    <!-- Gráfico -->
-                    <div class="bg-white p-6 rounded-2xl shadow-sm border border-purple-100">
-                        <div class="flex justify-between items-center mb-6">
-                            <div>
-                                <h3 class="text-lg font-bold text-gray-800">Fluxo de Vendas</h3>
-                                <p class="text-xs text-gray-400">Últimos 7 dias</p>
+                    <!-- Layout Dividido: Gráfico (2/3) + Agenda (1/3) -->
+                    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6 h-[calc(100%-140px)]">
+                        
+                        <!-- Coluna Esquerda: Gráfico -->
+                        <div class="lg:col-span-2 bg-white p-5 rounded-2xl shadow-sm border border-gray-100 flex flex-col">
+                            <div class="flex justify-between items-center mb-4">
+                                <div>
+                                    <h3 class="font-bold text-gray-800">Desempenho da Semana</h3>
+                                    <p class="text-xs text-gray-400">Comparativo últimos 7 dias</p>
+                                </div>
+                                <button class="text-xs text-purple-600 font-bold bg-purple-50 px-3 py-1 rounded hover:bg-purple-100 transition" onclick="document.getElementById('navRelatorios').click()">
+                                    Ver Detalhes <i class="fas fa-arrow-right ml-1"></i>
+                                </button>
+                            </div>
+                            <div class="relative flex-1 w-full min-h-[250px]">
+                                <canvas id="salesChart"></canvas>
                             </div>
                         </div>
-                        <div class="relative w-full h-80">
-                            <canvas id="salesChart"></canvas>
+
+                        <!-- Coluna Direita: Agenda do Dia -->
+                        <div class="bg-white p-5 rounded-2xl shadow-sm border border-gray-100 flex flex-col overflow-hidden relative">
+                            <!-- Cabeçalho Agenda -->
+                            <div class="flex justify-between items-center mb-4 border-b border-gray-50 pb-2">
+                                <h3 class="font-bold text-gray-800 flex items-center gap-2">
+                                    <i class="fas fa-calendar-check text-orange-500"></i> Encomendas Hoje
+                                </h3>
+                                <span class="text-[10px] bg-gray-100 text-gray-500 px-2 py-0.5 rounded font-bold">HOJE</span>
+                            </div>
+
+                            <!-- Lista Scrollável -->
+                            <div id="dashTodaySchedule" class="flex-1 overflow-y-auto custom-scrollbar space-y-3 pr-1">
+                                <!-- O JavaScript vai injetar os itens aqui ou a mensagem de vazio -->
+                                <div class="flex flex-col items-center justify-center h-full text-gray-300 opacity-60">
+                                    <i class="fas fa-mug-hot text-3xl mb-2"></i>
+                                    <p class="text-xs">Carregando agenda...</p>
+                                </div>
+                            </div>
+
+                            <!-- Botão Rápido -->
+                            <button onclick="document.getElementById('navEncomendas').click()" class="mt-4 w-full py-2 bg-orange-50 text-orange-600 text-xs font-bold rounded-lg hover:bg-orange-100 transition border border-orange-200">
+                                Ver Calendário Completo
+                            </button>
                         </div>
                     </div>
                 </section>
@@ -5023,6 +5218,16 @@ ARQUIVO: /src/renderer/index.html
                                     <div class="bg-white p-4 rounded-xl border border-gray-200 shadow-sm"><label class="text-xs font-bold text-gray-500 uppercase block mb-2">Adicionais Pagos (Upsell)</label><div id="chipsPaidAddonContainer" class="flex flex-wrap gap-2 mb-2 min-h-[40px]"></div><input id="inpPaidAddon" class="w-full text-xs p-2 border-b border-gray-200 focus:border-purple-500 outline-none bg-transparent" placeholder="Ex: Nutella=5..."></div>
                                 </div>
                                 <div><label class="text-xs font-bold text-gray-500 uppercase block mb-1">Taxa de Entrega (R$)</label><input type="number" id="cfgDeliveryFee" class="w-32 border rounded-lg p-2 text-sm font-bold" placeholder="0.00"></div>
+                                <div class="mt-4 p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
+                                    <label class="text-[10px] font-bold text-yellow-700 uppercase block mb-1">
+                                        <i class="fas fa-hand-paper mr-1"></i> Pedido Mínimo (Apenas Entrega)
+                                    </label>
+                                    <div class="flex items-center gap-2">
+                                        <input type="number" id="cfgMinDeliveryQty" class="w-24 border rounded-lg p-2 text-sm font-bold text-gray-700" placeholder="0">
+                                        <span class="text-xs text-gray-500">unidades (0 = sem mínimo)</span>
+                                    </div>
+                                    <p class="text-[10px] text-gray-400 mt-1">A IA recusará entregas com quantidade menor que esta.</p>
+                                </div>
                             </div>
                             <div id="step-3" class="step-panel hidden flex flex-col h-full animate-fade-in">
                                 <div class="flex gap-4 mb-4 items-end bg-gray-50 p-4 rounded-xl border border-gray-200">

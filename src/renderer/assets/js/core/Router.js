@@ -37,7 +37,8 @@ export class Router {
             'conversas': 'Atendimento', 
             'config': 'Configuração da Loja',
             'pos': 'PDV - Ponto de Venda',
-            'relatorios': 'Relatórios e Análises'
+            'relatorios': 'Relatórios e Análises',
+            'broadcast': 'Disparo em Massa'
         };
         const titleEl = $('currentSectionTitle');
         if(titleEl) titleEl.textContent = titles[sectionId] || 'App';

@@ -342,6 +342,48 @@ class DatabaseService {
             return { success: false, error: e.message };
         }
     }
+
+    /**
+     * Retorna todos os clientes ativos ou uma lista de clientes por IDs.
+     * @param {string[]} [clientIds] - Opcional. Array de IDs de clientes para buscar.
+     * @returns {Promise<Object[]>} Array de objetos de cliente.
+     */
+    async getClientsByIds(clientIds) {
+        try {
+            let query = this.db.collection('clients');
+            
+            if (clientIds && Array.isArray(clientIds) && clientIds.length > 0) {
+                // Divide o array de IDs em chunks de 10, pois Firestore 'in' query tem limite de 10.
+                const chunks = [];
+                for (let i = 0; i < clientIds.length; i += 10) {
+                    chunks.push(clientIds.slice(i, i + 10));
+                }
+
+                const clientDocs = [];
+                for (const chunk of chunks) {
+                    const chunkSnapshot = await query.where(admin.firestore.FieldPath.documentId(), 'in', chunk).get();
+                    chunkSnapshot.forEach(doc => {
+                        const data = doc.data();
+                        // Garante que o cliente tenha um telefone para envio
+                        if (data.phone) { 
+                            clientDocs.push({ id: doc.id, ...data });
+                        }
+                    });
+                }
+                return clientDocs;
+
+            } else {
+                // Se nenhum ID for fornecido, retorna todos os clientes com telefone.
+                const snapshot = await query.where('phone', '!=', null).get();
+                const clients = [];
+                snapshot.forEach(doc => clients.push({ id: doc.id, ...doc.data() }));
+                return clients;
+            }
+        } catch (error) {
+            console.error('[DB] Erro ao buscar clientes por IDs:', error);
+            return [];
+        }
+    }
 }
 
 module.exports = DatabaseService;
